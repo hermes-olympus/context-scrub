@@ -1,25 +1,48 @@
-# ctx-scrub Claude v0.1 Quickstart
+# ctx-scrub Claude v0.2 Quickstart
 
 Use this flow for a real Claude Code project.
 
 ## 1. Check Readiness
 
 ```bash
-cd /home/shikhar/openclaw/research/context-scrub/claude
-./ctx_scrub_claude.py doctor
+cd /home/shikhar/openclaw/research/context-scrub
+./ctxscrub doctor
 ```
 
-## 2. Find The Right Session
+## 2. Open The Interactive CLI
+
+```bash
+./ctxscrub
+```
+
+Keys:
+
+- `j/k` or arrow keys: move
+- `/`: filter sessions
+- `Enter`: choose session
+- `space`: mark/unmark match
+- `a`: select all matches
+- `n`: select none
+- `e`: edit replacement marker
+- `r`: redact selected matches
+- `q`: quit
+
+## 3. Scriptable Flow
+
+Use this when you want exact command control instead of the TUI.
+
+### Find The Right Session
 
 Avoid `--latest` for real work unless you are certain it is the session you want.
 
 ```bash
+cd /home/shikhar/openclaw/research/context-scrub/claude
 ./ctx_scrub_claude.py list --project-contains "your-project-name" --limit 10
 ```
 
 Copy the target `session=<uuid>` value.
 
-## 3. Inspect The Session
+### Inspect The Session
 
 ```bash
 ./ctx_scrub_claude.py inspect --session-id <session-id>
@@ -27,7 +50,7 @@ Copy the target `session=<uuid>` value.
 
 Proceed only if `missing_parent_refs=0`.
 
-## 4. Search Exact Text
+### Search Exact Text
 
 ```bash
 ./ctx_scrub_claude.py search --session-id <session-id> --query "text to remove"
@@ -35,7 +58,7 @@ Proceed only if `missing_parent_refs=0`.
 
 Review the field paths and snippets carefully.
 
-## 5. Redact Safely
+### Redact Safely
 
 Dry-run first:
 
@@ -67,7 +90,7 @@ The review command applies only if you type exactly:
 REDACT
 ```
 
-## 6. Verify
+### Verify
 
 ```bash
 ./ctx_scrub_claude.py verify --session-id <session-id> --query "text to remove"
@@ -79,7 +102,7 @@ Success means:
 - parent links are intact
 - the query is gone
 
-## 7. Continue Claude
+### Continue Claude
 
 ```bash
 ./ctx_scrub_claude.py clean-prompt --session-id <session-id> --query "text to remove"
@@ -87,7 +110,7 @@ Success means:
 
 Use the generated continuation prompt when resuming Claude Code.
 
-## 8. Roll Back If Needed
+### Roll Back If Needed
 
 ```bash
 ./ctx_scrub_claude.py backups --session-id <session-id>

@@ -1,6 +1,6 @@
 # ctx-scrub Claude Code Plan
 
-Current prototype version: `0.1.0`
+Current prototype version: `0.2.0`
 
 Quickstart: `QUICKSTART.md`
 
@@ -173,6 +173,10 @@ Initial behavior should be dry-run first.
 
 The prototype currently supports:
 
+- default interactive TUI via `./ctxscrub`
+- session picker with keyboard navigation and `/` filtering
+- match review with `space` selection
+- batch redaction of only selected fields
 - listing Claude Code JSONL sessions
 - inspecting row counts, event types, roles, and parent-link integrity
 - filtering sessions by project path, recency, and subagent inclusion

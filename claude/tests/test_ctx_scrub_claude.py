@@ -76,6 +76,16 @@ class CtxScrubClaudeTests(unittest.TestCase):
         self.assertNotIn("SECRET_BETA", dumped)
         self.assertIn("[REDACTED]", dumped)
 
+    def test_selected_redaction_only_changes_marked_fields(self) -> None:
+        matches = self.mod.search_text(self.path, "SECRET_BETA")
+        selected = [match for match in matches if match.field_path == "$.message.content"]
+        rows = self.mod.read_rows(self.path)
+        new_rows, count = self.mod.redact_selected_matches(rows, "SECRET_BETA", "[REDACTED]", selected)
+        self.assertEqual(count, 1)
+        dumped = "".join(self.mod.json_dumps(row) for row in new_rows)
+        self.assertIn("[REDACTED]", dumped)
+        self.assertEqual(dumped.count("SECRET_BETA"), 2)
+
     def test_cli_redact_apply_and_verify(self) -> None:
         backup_dir = Path(self.tmp.name) / "backups"
         result = subprocess.run(

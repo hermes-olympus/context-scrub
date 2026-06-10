@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import curses
 import json
 import shutil
 from dataclasses import dataclass
@@ -16,7 +17,7 @@ CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_BACKUP_DIR = SCRIPT_DIR / "backups"
 AUDIT_LOG = SCRIPT_DIR / "audit.jsonl"
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 
 @dataclass
@@ -51,6 +52,12 @@ class Match:
     uuid: str
     field_path: str
     snippet: str
+
+
+@dataclass
+class MatchSelection:
+    match: Match
+    selected: bool = False
 
 
 def iter_jsonl_files() -> list[Path]:
@@ -172,6 +179,60 @@ def replace_string_values(value: Any, query: str, replacement: str) -> tuple[Any
             total += count
         return new_obj, total
     return value, 0
+
+
+def parse_field_path(path: str) -> list[str | int]:
+    if not path.startswith("$"):
+        raise ValueError(f"Unsupported field path: {path}")
+    tokens: list[str | int] = []
+    i = 1
+    while i < len(path):
+        if path[i] == ".":
+            i += 1
+            start = i
+            while i < len(path) and path[i] not in ".[":
+                i += 1
+            tokens.append(path[start:i])
+        elif path[i] == "[":
+            end = path.index("]", i)
+            tokens.append(int(path[i + 1 : end]))
+            i = end + 1
+        else:
+            raise ValueError(f"Unsupported field path: {path}")
+    return tokens
+
+
+def get_path_value(value: Any, tokens: list[str | int]) -> Any:
+    current = value
+    for token in tokens:
+        current = current[token]
+    return current
+
+
+def set_path_value(value: Any, tokens: list[str | int], new_value: Any) -> None:
+    current = value
+    for token in tokens[:-1]:
+        current = current[token]
+    current[tokens[-1]] = new_value
+
+
+def redact_selected_matches(rows: list[dict], query: str, replacement: str, selections: list[Match]) -> tuple[list[dict], int]:
+    by_line_and_path = {(selection.line_no, selection.field_path) for selection in selections}
+    redacted_rows: list[dict] = []
+    total = 0
+    for line_no, row in enumerate(rows, start=1):
+        new_row = json.loads(json_dumps(row))
+        for _, field_path in [item for item in by_line_and_path if item[0] == line_no]:
+            tokens = parse_field_path(field_path)
+            value = get_path_value(new_row, tokens)
+            if not isinstance(value, str):
+                continue
+            count = value.count(query)
+            if count:
+                set_path_value(new_row, tokens, value.replace(query, replacement))
+                total += count
+        redacted_rows.append(new_row)
+    return redacted_rows, total
 
 
 def row_role(row: dict) -> str:
@@ -346,6 +407,54 @@ def apply_redaction(
     return count, backup
 
 
+def apply_selected_redaction(
+    path: Path,
+    query: str,
+    replacement: str,
+    selections: list[Match],
+    backup_dir: str | None,
+    recent_threshold_seconds: int,
+    allow_recent: bool,
+) -> tuple[int, Path]:
+    assert_not_recently_modified(path, recent_threshold_seconds, allow_recent)
+    rows = read_rows(path)
+    new_rows, count = redact_selected_matches(rows, query, replacement, selections)
+    if count == 0:
+        return 0, Path("")
+
+    backup = backup_file(path, backup_dir)
+    write_rows(path, new_rows)
+    verified_rows = read_rows(path)
+    _, missing = validate_parent_chain(verified_rows)
+    remaining = search_text(path, query)
+    selected_keys = {(selection.line_no, selection.field_path) for selection in selections}
+    selected_still_contains = [match for match in remaining if (match.line_no, match.field_path) in selected_keys]
+    if missing or selected_still_contains:
+        shutil.copy2(backup, path)
+        audit(
+            "selected_redact_failed_restored",
+            path=str(path),
+            backup=str(backup),
+            replacement=replacement,
+            missing_parent_refs=missing,
+            selected_still_contains=len(selected_still_contains),
+        )
+        raise SystemExit(
+            "Selected redaction verification failed; restored backup. "
+            f"missing_parent_refs={missing} selected_still_contains={len(selected_still_contains)}"
+        )
+    audit(
+        "selected_redact",
+        path=str(path),
+        backup=str(backup),
+        selected_matches=len(selections),
+        occurrences=count,
+        replacement=replacement,
+        session_id=path.stem,
+    )
+    return count, backup
+
+
 def cmd_redact(args: argparse.Namespace) -> None:
     replacement = args.replacement or "[CTX_SCRUB_REDACTED]"
     for path in select_paths(args):
@@ -404,6 +513,182 @@ def cmd_review(args: argparse.Namespace) -> None:
         )
         print(f"applied {applied} replacements in {path}")
         print(f"  backup={backup}")
+
+
+def tui_draw_header(stdscr, title: str, subtitle: str = "") -> None:
+    height, width = stdscr.getmaxyx()
+    stdscr.addnstr(0, 0, title.ljust(width), width, curses.A_REVERSE)
+    if subtitle and height > 1:
+        stdscr.addnstr(1, 0, subtitle[: width - 1], width - 1)
+
+
+def tui_status(stdscr, text: str) -> None:
+    height, width = stdscr.getmaxyx()
+    stdscr.addnstr(height - 1, 0, text.ljust(width), width, curses.A_REVERSE)
+
+
+def tui_prompt(stdscr, prompt: str) -> str:
+    curses.echo()
+    curses.curs_set(1)
+    height, width = stdscr.getmaxyx()
+    stdscr.move(height - 2, 0)
+    stdscr.clrtoeol()
+    stdscr.addnstr(height - 2, 0, prompt, width - 1)
+    stdscr.refresh()
+    raw = stdscr.getstr(height - 2, min(len(prompt), width - 2), max(1, width - len(prompt) - 1))
+    curses.noecho()
+    curses.curs_set(0)
+    return raw.decode("utf-8", errors="replace").strip()
+
+
+def tui_select_session(stdscr, sessions: list[Path]) -> Path | None:
+    index = 0
+    offset = 0
+    while True:
+        stdscr.erase()
+        height, width = stdscr.getmaxyx()
+        tui_draw_header(stdscr, "ctxscrub Claude - choose session", "Enter: select  j/k/arrows: move  /: filter  q: quit")
+        visible_rows = max(1, height - 4)
+        if index < offset:
+            offset = index
+        if index >= offset + visible_rows:
+            offset = index - visible_rows + 1
+        for screen_row, path in enumerate(sessions[offset : offset + visible_rows], start=2):
+            info = session_info(path)
+            when = datetime.fromtimestamp(info.mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+            marker = ">" if offset + screen_row - 2 == index else " "
+            label = f"{marker} {when} rows={info.rows} {path.stem[:8]} {project_label(path)}"
+            attr = curses.A_REVERSE if marker == ">" else curses.A_NORMAL
+            stdscr.addnstr(screen_row, 0, label, width - 1, attr)
+        tui_status(stdscr, f"{len(sessions)} sessions. Subagents hidden by default.")
+        key = stdscr.getch()
+        if key in (ord("q"), 27):
+            return None
+        if key in (curses.KEY_DOWN, ord("j")) and index < len(sessions) - 1:
+            index += 1
+        elif key in (curses.KEY_UP, ord("k")) and index > 0:
+            index -= 1
+        elif key in (curses.KEY_ENTER, 10, 13):
+            return sessions[index] if sessions else None
+        elif key == ord("/"):
+            query = tui_prompt(stdscr, "filter project/path: ")
+            if query:
+                filtered = [p for p in iter_jsonl_files() if not is_subagent_path(p) and query.lower() in str(p).lower()]
+                if filtered:
+                    sessions = filtered
+                    index = 0
+                    offset = 0
+
+
+def tui_review_matches(stdscr, path: Path, query: str, matches: list[Match]) -> tuple[list[Match], str] | None:
+    selections = [MatchSelection(match=match, selected=True) for match in matches]
+    index = 0
+    offset = 0
+    replacement = "[CTX_SCRUB_REDACTED]"
+    while True:
+        stdscr.erase()
+        height, width = stdscr.getmaxyx()
+        selected_count = sum(1 for item in selections if item.selected)
+        tui_draw_header(
+            stdscr,
+            "ctxscrub Claude - mark redactions",
+            f"space: toggle  a: all  n: none  r: redact {selected_count}/{len(selections)}  e: replacement  q: quit",
+        )
+        stdscr.addnstr(2, 0, f"Session: {path.stem}  Query: {query}  Replacement: {replacement}", width - 1)
+        visible_rows = max(1, height - 6)
+        if index < offset:
+            offset = index
+        if index >= offset + visible_rows:
+            offset = index - visible_rows + 1
+        for screen_row, item in enumerate(selections[offset : offset + visible_rows], start=4):
+            selected = "[x]" if item.selected else "[ ]"
+            marker = ">" if offset + screen_row - 4 == index else " "
+            match = item.match
+            label = f"{marker} {selected} line {match.line_no} {match.role} {match.field_path} :: {match.snippet}"
+            attr = curses.A_REVERSE if marker == ">" else curses.A_NORMAL
+            stdscr.addnstr(screen_row, 0, label, width - 1, attr)
+        tui_status(stdscr, "Review carefully. Redaction changes only selected fields and creates a backup.")
+        key = stdscr.getch()
+        if key in (ord("q"), 27):
+            return None
+        if key in (curses.KEY_DOWN, ord("j")) and index < len(selections) - 1:
+            index += 1
+        elif key in (curses.KEY_UP, ord("k")) and index > 0:
+            index -= 1
+        elif key == ord(" "):
+            selections[index].selected = not selections[index].selected
+        elif key == ord("a"):
+            for item in selections:
+                item.selected = True
+        elif key == ord("n"):
+            for item in selections:
+                item.selected = False
+        elif key == ord("e"):
+            new_replacement = tui_prompt(stdscr, "replacement: ")
+            if new_replacement:
+                replacement = new_replacement
+        elif key == ord("r"):
+            chosen = [item.match for item in selections if item.selected]
+            if not chosen:
+                tui_status(stdscr, "No matches selected. Press any key.")
+                stdscr.getch()
+                continue
+            confirm = tui_prompt(stdscr, f"Type REDACT to apply {len(chosen)} selected redactions: ")
+            if confirm == "REDACT":
+                return chosen, replacement
+
+
+def run_tui(stdscr, args: argparse.Namespace) -> None:
+    curses.curs_set(0)
+    stdscr.keypad(True)
+    sessions = [p for p in iter_jsonl_files() if not is_subagent_path(p)]
+    if args.project_contains:
+        sessions = [p for p in sessions if args.project_contains.lower() in str(p).lower()]
+    if not sessions:
+        raise SystemExit("No Claude Code sessions found.")
+    selected_session = tui_select_session(stdscr, sessions)
+    if selected_session is None:
+        return
+    query = args.query or tui_prompt(stdscr, "text to find/redact: ")
+    if not query:
+        return
+    matches = search_text(selected_session, query)
+    if not matches:
+        stdscr.erase()
+        tui_draw_header(stdscr, "ctxscrub Claude", "No matches found. Press any key.")
+        stdscr.getch()
+        return
+    review = tui_review_matches(stdscr, selected_session, query, matches)
+    if review is None:
+        return
+    chosen, replacement = review
+    applied, backup = apply_selected_redaction(
+        selected_session,
+        query,
+        replacement,
+        chosen,
+        args.backup_dir,
+        args.recent_threshold_seconds,
+        args.allow_recent,
+    )
+    remaining = search_text(selected_session, query)
+    stdscr.erase()
+    tui_draw_header(stdscr, "ctxscrub Claude - redaction complete")
+    lines = [
+        f"Applied replacements: {applied}",
+        f"Selected fields: {len(chosen)}",
+        f"Backup: {backup}",
+        f"Remaining matches for query: {len(remaining)}",
+        "",
+        "Press any key to exit.",
+    ]
+    for row, line in enumerate(lines, start=2):
+        stdscr.addnstr(row, 0, line, max(1, stdscr.getmaxyx()[1] - 1))
+    stdscr.getch()
+
+
+def cmd_tui(args: argparse.Namespace) -> None:
+    curses.wrapper(run_tui, args)
 
 
 def cmd_clean_prompt(args: argparse.Namespace) -> None:
@@ -487,7 +772,22 @@ def cmd_doctor(args: argparse.Namespace) -> None:
 
 
 def cmd_workflow(args: argparse.Namespace) -> None:
-    print("v0.1 live Claude Code redaction workflow")
+    print("v0.2 live Claude Code redaction workflow")
+    print()
+    print("Interactive flow:")
+    print("   ./ctxscrub")
+    print()
+    print("Keys:")
+    print("   j/k or arrows  move")
+    print("   /              filter sessions")
+    print("   space          mark/unmark match")
+    print("   a              select all matches")
+    print("   n              select none")
+    print("   e              edit replacement")
+    print("   r              redact selected matches")
+    print("   q              quit")
+    print()
+    print("Scriptable flow:")
     print()
     print("1. Find the right session:")
     print("   ./ctx_scrub_claude.py list --project-contains '<project-name>' --limit 10")
@@ -516,7 +816,13 @@ def cmd_workflow(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Claude Code JSONL context scrubber prototype")
     parser.add_argument("--version", action="version", version=f"ctx-scrub-claude {VERSION}")
-    sub = parser.add_subparsers(dest="cmd", required=True)
+    parser.set_defaults(func=cmd_tui)
+    parser.add_argument("--project-contains", help="Pre-filter TUI sessions whose path contains this text")
+    parser.add_argument("--query", help="Pre-fill TUI search query")
+    parser.add_argument("--backup-dir")
+    parser.add_argument("--recent-threshold-seconds", type=int, default=15)
+    parser.add_argument("--allow-recent", action="store_true", help="Allow mutation of a recently modified JSONL")
+    sub = parser.add_subparsers(dest="cmd")
 
     def add_selectors(p: argparse.ArgumentParser) -> None:
         p.add_argument("--latest", action="store_true", help="Use the newest Claude JSONL session")
@@ -525,6 +831,14 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--project-contains", help="Only consider sessions whose path contains this text")
         p.add_argument("--last-minutes", type=int, help="Only consider sessions modified within this many minutes")
         p.add_argument("--include-subagents", action="store_true", help="Include subagent JSONL files")
+
+    p_tui = sub.add_parser("tui", help="Open interactive terminal UI")
+    p_tui.add_argument("--project-contains", help="Pre-filter sessions whose path contains this text")
+    p_tui.add_argument("--query", help="Pre-fill search query")
+    p_tui.add_argument("--backup-dir")
+    p_tui.add_argument("--recent-threshold-seconds", type=int, default=15)
+    p_tui.add_argument("--allow-recent", action="store_true", help="Allow mutation of a recently modified JSONL")
+    p_tui.set_defaults(func=cmd_tui)
 
     p_list = sub.add_parser("list", help="List Claude JSONL sessions")
     add_selectors(p_list)

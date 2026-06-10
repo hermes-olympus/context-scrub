@@ -18,17 +18,26 @@ cd context-scrub/claude
 
 The first supported provider is Claude Code. v0.1 focuses on safe exact-text redaction in Claude Code JSONL session files.
 
-## Claude Code v0.1
+## Claude Code v0.2
+
+```bash
+./ctxscrub
+```
+
+Default interactive flow:
+
+- pick a Claude Code session
+- enter text to find
+- review all matching context fields
+- press `space` to mark/unmark matches
+- press `r` to redact selected matches
+- type `REDACT` to confirm
+- ctx-scrub creates a backup and verifies the JSONL
+
+Scriptable flow:
 
 ```bash
 cd claude
-./ctx_scrub_claude.py doctor
-./ctx_scrub_claude.py workflow
-```
-
-Live-session flow:
-
-```bash
 ./ctx_scrub_claude.py list --project-contains "your-project" --limit 10
 ./ctx_scrub_claude.py inspect --session-id <session-id>
 ./ctx_scrub_claude.py search --session-id <session-id> --query "text to remove"

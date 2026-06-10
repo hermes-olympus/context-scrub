@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+"""ctxscrub default launcher."""
+
+from claude.ctx_scrub_claude import main
+
+
+if __name__ == "__main__":
+    main()
