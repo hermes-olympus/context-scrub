@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import curses
 import json
+import os
 import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -13,11 +14,13 @@ from pathlib import Path
 from typing import Any
 
 
-CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
+CLAUDE_PROJECTS = Path(os.environ.get("CTXSCRUB_CLAUDE_PROJECTS", Path.home() / ".claude" / "projects")).expanduser()
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_BACKUP_DIR = SCRIPT_DIR / "backups"
 AUDIT_LOG = SCRIPT_DIR / "audit.jsonl"
-VERSION = "0.2.0"
+VERSION = "0.2.1"
+MIN_TUI_HEIGHT = 8
+MIN_TUI_WIDTH = 32
 
 
 @dataclass
@@ -515,16 +518,42 @@ def cmd_review(args: argparse.Namespace) -> None:
         print(f"  backup={backup}")
 
 
+def tui_write(stdscr, row: int, col: int, text: str, attr: int = curses.A_NORMAL) -> None:
+    height, width = stdscr.getmaxyx()
+    if row < 0 or row >= height or col < 0 or col >= width:
+        return
+    available = max(0, width - col - 1)
+    if available <= 0:
+        return
+    try:
+        stdscr.addnstr(row, col, text[:available], available, attr)
+    except curses.error:
+        pass
+
+
+def tui_check_size(stdscr) -> bool:
+    height, width = stdscr.getmaxyx()
+    if height >= MIN_TUI_HEIGHT and width >= MIN_TUI_WIDTH:
+        return True
+    stdscr.erase()
+    tui_write(stdscr, 0, 0, "ctxscrub needs a larger terminal", curses.A_REVERSE)
+    tui_write(stdscr, 2, 0, f"Current: {width}x{height}")
+    tui_write(stdscr, 3, 0, f"Minimum: {MIN_TUI_WIDTH}x{MIN_TUI_HEIGHT}")
+    tui_write(stdscr, max(0, height - 2), 0, "Resize terminal, or press q to quit.")
+    stdscr.refresh()
+    return False
+
+
 def tui_draw_header(stdscr, title: str, subtitle: str = "") -> None:
     height, width = stdscr.getmaxyx()
-    stdscr.addnstr(0, 0, title.ljust(width), width, curses.A_REVERSE)
+    tui_write(stdscr, 0, 0, title.ljust(width), curses.A_REVERSE)
     if subtitle and height > 1:
-        stdscr.addnstr(1, 0, subtitle[: width - 1], width - 1)
+        tui_write(stdscr, 1, 0, subtitle)
 
 
 def tui_status(stdscr, text: str) -> None:
     height, width = stdscr.getmaxyx()
-    stdscr.addnstr(height - 1, 0, text.ljust(width), width, curses.A_REVERSE)
+    tui_write(stdscr, height - 1, 0, text.ljust(width), curses.A_REVERSE)
 
 
 def tui_prompt(stdscr, prompt: str) -> str:
@@ -533,7 +562,7 @@ def tui_prompt(stdscr, prompt: str) -> str:
     height, width = stdscr.getmaxyx()
     stdscr.move(height - 2, 0)
     stdscr.clrtoeol()
-    stdscr.addnstr(height - 2, 0, prompt, width - 1)
+    tui_write(stdscr, height - 2, 0, prompt)
     stdscr.refresh()
     raw = stdscr.getstr(height - 2, min(len(prompt), width - 2), max(1, width - len(prompt) - 1))
     curses.noecho()
@@ -546,6 +575,10 @@ def tui_select_session(stdscr, sessions: list[Path]) -> Path | None:
     offset = 0
     while True:
         stdscr.erase()
+        if not tui_check_size(stdscr):
+            if stdscr.getch() in (ord("q"), 27):
+                return None
+            continue
         height, width = stdscr.getmaxyx()
         tui_draw_header(stdscr, "ctxscrub Claude - choose session", "Enter: select  j/k/arrows: move  /: filter  q: quit")
         visible_rows = max(1, height - 4)
@@ -559,7 +592,7 @@ def tui_select_session(stdscr, sessions: list[Path]) -> Path | None:
             marker = ">" if offset + screen_row - 2 == index else " "
             label = f"{marker} {when} rows={info.rows} {path.stem[:8]} {project_label(path)}"
             attr = curses.A_REVERSE if marker == ">" else curses.A_NORMAL
-            stdscr.addnstr(screen_row, 0, label, width - 1, attr)
+            tui_write(stdscr, screen_row, 0, label, attr)
         tui_status(stdscr, f"{len(sessions)} sessions. Subagents hidden by default.")
         key = stdscr.getch()
         if key in (ord("q"), 27):
@@ -587,6 +620,10 @@ def tui_review_matches(stdscr, path: Path, query: str, matches: list[Match]) -> 
     replacement = "[CTX_SCRUB_REDACTED]"
     while True:
         stdscr.erase()
+        if not tui_check_size(stdscr):
+            if stdscr.getch() in (ord("q"), 27):
+                return None
+            continue
         height, width = stdscr.getmaxyx()
         selected_count = sum(1 for item in selections if item.selected)
         tui_draw_header(
@@ -594,7 +631,7 @@ def tui_review_matches(stdscr, path: Path, query: str, matches: list[Match]) -> 
             "ctxscrub Claude - mark redactions",
             f"space: toggle  a: all  n: none  r: redact {selected_count}/{len(selections)}  e: replacement  q: quit",
         )
-        stdscr.addnstr(2, 0, f"Session: {path.stem}  Query: {query}  Replacement: {replacement}", width - 1)
+        tui_write(stdscr, 2, 0, f"Session: {path.stem}  Query: {query}  Replacement: {replacement}")
         visible_rows = max(1, height - 6)
         if index < offset:
             offset = index
@@ -606,7 +643,7 @@ def tui_review_matches(stdscr, path: Path, query: str, matches: list[Match]) -> 
             match = item.match
             label = f"{marker} {selected} line {match.line_no} {match.role} {match.field_path} :: {match.snippet}"
             attr = curses.A_REVERSE if marker == ">" else curses.A_NORMAL
-            stdscr.addnstr(screen_row, 0, label, width - 1, attr)
+            tui_write(stdscr, screen_row, 0, label, attr)
         tui_status(stdscr, "Review carefully. Redaction changes only selected fields and creates a backup.")
         key = stdscr.getch()
         if key in (ord("q"), 27):
@@ -683,7 +720,7 @@ def run_tui(stdscr, args: argparse.Namespace) -> None:
         "Press any key to exit.",
     ]
     for row, line in enumerate(lines, start=2):
-        stdscr.addnstr(row, 0, line, max(1, stdscr.getmaxyx()[1] - 1))
+        tui_write(stdscr, row, 0, line)
     stdscr.getch()
 
 

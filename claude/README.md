@@ -1,6 +1,6 @@
 # ctx-scrub Claude Code Plan
 
-Current prototype version: `0.2.0`
+Current prototype version: `0.2.1`
 
 Quickstart: `QUICKSTART.md`
 
@@ -191,6 +191,12 @@ The prototype currently supports:
 - automatic rollback if verification fails
 - clean continuation prompt generation
 - `doctor`, `workflow`, and `--version`
+
+For disposable tests, point the tool at a fake Claude projects directory:
+
+```bash
+CTXSCRUB_CLAUDE_PROJECTS=/tmp/ctxscrub-fixtures ./ctxscrub
+```
 
 ## Context Scoring
 

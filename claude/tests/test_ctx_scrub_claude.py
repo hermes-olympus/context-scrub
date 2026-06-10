@@ -119,6 +119,25 @@ class CtxScrubClaudeTests(unittest.TestCase):
         )
         self.assertIn("contains_query=False", verify.stdout)
 
+    def test_tui_status_clips_to_avoid_curses_edge_errors(self) -> None:
+        class EdgeSensitiveWindow:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def getmaxyx(self):
+                return (5, 10)
+
+            def addnstr(self, row, col, text, n, attr=0):
+                self.calls.append((row, col, text, n, attr))
+                if row == 4 and col + n >= 10:
+                    raise self.mod.curses.error("addnwstr() returned ERR")
+
+        window = EdgeSensitiveWindow()
+        window.mod = self.mod
+        self.mod.tui_status(window, "this is deliberately wider than the terminal")
+        self.assertEqual(window.calls[0][0], 4)
+        self.assertLess(window.calls[0][3], 10)
+
 
 if __name__ == "__main__":
     unittest.main()
