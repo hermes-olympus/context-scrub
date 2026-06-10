@@ -146,6 +146,64 @@ class CtxScrubClaudeTests(unittest.TestCase):
         self.assertIn("input:", text)
         self.assertIn("file_path", text)
 
+    def test_default_transcript_view_hides_low_value_metadata(self) -> None:
+        items = [
+            self.mod.TranscriptSelection(
+                self.mod.TranscriptItem(1, "ai-title", "ai-title", "", "$", "AI-TITLE line 1", {"aiTitle": "x"})
+            ),
+            self.mod.TranscriptSelection(
+                self.mod.TranscriptItem(2, "user", "text", "", "$.message.content", "USER line 2", "real prompt")
+            ),
+            self.mod.TranscriptSelection(
+                self.mod.TranscriptItem(3, "queue-operation", "queue-operation", "", "$", "QUEUE line 3", {})
+            ),
+        ]
+        self.assertEqual(self.mod.transcript_visible_indexes(items, show_meta=False), [1])
+        self.assertEqual(self.mod.transcript_visible_indexes(items, show_meta=True), [0, 1, 2])
+
+    def test_transcript_offset_keeps_current_block_on_screen(self) -> None:
+        selections = [
+            self.mod.TranscriptSelection(
+                self.mod.TranscriptItem(
+                    line_no=idx,
+                    role="assistant",
+                    kind="text",
+                    uuid=f"a{idx}",
+                    field_path="$.message.content",
+                    title=f"ASSISTANT line {idx}",
+                    body="short line",
+                )
+            )
+            for idx in range(8)
+        ]
+        visible_indexes = list(range(len(selections)))
+        offset = self.mod.ensure_transcript_offset_visible(
+            selections,
+            visible_indexes,
+            index=7,
+            offset=0,
+            visible_rows=10,
+            width=60,
+            current_body_lines=8,
+            compact_body_lines=4,
+        )
+        rows_before_current = sum(
+            self.mod.transcript_block_line_count(
+                selections[visible_indexes[local_index]],
+                60,
+                current=False,
+                max_body_lines=4,
+            )
+            for local_index in range(offset, 7)
+        )
+        current_rows = self.mod.transcript_block_line_count(
+            selections[7],
+            60,
+            current=True,
+            max_body_lines=8,
+        )
+        self.assertLessEqual(rows_before_current + min(current_rows, 10), 10)
+
     def test_transcript_redaction_replaces_marked_block_only(self) -> None:
         rows = self.mod.read_rows(self.path)
         transcript = self.mod.build_transcript(rows)

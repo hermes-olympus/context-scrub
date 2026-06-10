@@ -19,11 +19,25 @@ CLAUDE_PROJECTS = Path(os.environ.get("CTXSCRUB_CLAUDE_PROJECTS", Path.home() / 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_BACKUP_DIR = SCRIPT_DIR / "backups"
 AUDIT_LOG = SCRIPT_DIR / "audit.jsonl"
-VERSION = "0.3.3"
+VERSION = "0.3.4"
 MIN_TUI_HEIGHT = 8
 MIN_TUI_WIDTH = 32
 SESSION_PREVIEW_LINE_LIMIT = 80
 SESSION_PREVIEW_BYTES_LIMIT = 256_000
+LOW_VALUE_TRANSCRIPT_KINDS = {
+    "agent-name",
+    "ai-title",
+    "attachment",
+    "custom-title",
+    "file-history-snapshot",
+    "mode",
+    "permission-mode",
+    "queue-operation",
+    "result",
+    "started",
+    "system",
+    "thinking",
+}
 
 
 @dataclass
@@ -281,6 +295,18 @@ def readable_transcript_body(item: TranscriptItem) -> str:
             return readable_tool_result_body(body)
         return json.dumps(body, ensure_ascii=False, indent=2, sort_keys=True)
     return json.dumps(body, ensure_ascii=False, indent=2, sort_keys=True)
+
+
+def is_low_value_transcript_item(item: TranscriptItem) -> bool:
+    return item.kind in LOW_VALUE_TRANSCRIPT_KINDS or item.role in LOW_VALUE_TRANSCRIPT_KINDS
+
+
+def transcript_visible_indexes(selections: list[TranscriptSelection], show_meta: bool) -> list[int]:
+    return [
+        idx
+        for idx, selection in enumerate(selections)
+        if show_meta or not is_low_value_transcript_item(selection.item)
+    ]
 
 
 def session_display_name(path: Path) -> str:
@@ -852,6 +878,13 @@ def tui_write(stdscr, row: int, col: int, text: str, attr: int = curses.A_NORMAL
         pass
 
 
+def tui_curs_set(visibility: int) -> None:
+    try:
+        curses.curs_set(visibility)
+    except curses.error:
+        pass
+
+
 def tui_check_size(stdscr) -> bool:
     height, width = stdscr.getmaxyx()
     if height >= MIN_TUI_HEIGHT and width >= MIN_TUI_WIDTH:
@@ -879,7 +912,7 @@ def tui_status(stdscr, text: str) -> None:
 
 def tui_prompt(stdscr, prompt: str) -> str:
     curses.echo()
-    curses.curs_set(1)
+    tui_curs_set(1)
     height, width = stdscr.getmaxyx()
     stdscr.move(height - 2, 0)
     stdscr.clrtoeol()
@@ -887,7 +920,7 @@ def tui_prompt(stdscr, prompt: str) -> str:
     stdscr.refresh()
     raw = stdscr.getstr(height - 2, min(len(prompt), width - 2), max(1, width - len(prompt) - 1))
     curses.noecho()
-    curses.curs_set(0)
+    tui_curs_set(0)
     return raw.decode("utf-8", errors="replace").strip()
 
 
@@ -1057,11 +1090,66 @@ def render_transcript_block(
     return rendered
 
 
+def transcript_block_line_count(
+    selection: TranscriptSelection,
+    width: int,
+    current: bool,
+    max_body_lines: int,
+) -> int:
+    return len(
+        render_transcript_block(
+            selection.item,
+            width,
+            current=current,
+            selected=selection.selected,
+            max_body_lines=max_body_lines,
+        )
+    )
+
+
+def ensure_transcript_offset_visible(
+    selections: list[TranscriptSelection],
+    visible_indexes: list[int],
+    index: int,
+    offset: int,
+    visible_rows: int,
+    width: int,
+    current_body_lines: int,
+    compact_body_lines: int,
+) -> int:
+    if not visible_indexes:
+        return 0
+    index = max(0, min(index, len(visible_indexes) - 1))
+    offset = max(0, min(offset, index))
+
+    while offset < index:
+        rows_before_current = 0
+        for local_index in range(offset, index):
+            rows_before_current += transcript_block_line_count(
+                selections[visible_indexes[local_index]],
+                width,
+                current=False,
+                max_body_lines=compact_body_lines,
+            )
+        current_rows = transcript_block_line_count(
+            selections[visible_indexes[index]],
+            width,
+            current=True,
+            max_body_lines=current_body_lines,
+        )
+        if rows_before_current + min(current_rows, visible_rows) <= visible_rows:
+            break
+        offset += 1
+
+    return offset
+
+
 def tui_browse_transcript(stdscr, path: Path) -> tuple[list[TranscriptItem], str] | None:
     rows = read_rows(path)
     row_count = len(rows)
     selections = [TranscriptSelection(item=item, selected=False) for item in build_transcript(rows)]
-    visible_indexes = list(range(len(selections)))
+    show_meta = False
+    visible_indexes = transcript_visible_indexes(selections, show_meta)
     index = 0
     offset = 0
     replacement = "[CTX_SCRUB_REDACTED]"
@@ -1075,16 +1163,15 @@ def tui_browse_transcript(stdscr, path: Path) -> tuple[list[TranscriptItem], str
             continue
         height, width = stdscr.getmaxyx()
         selected_count = sum(1 for item in selections if item.selected)
-        subtitle = (
-            "space: mark  r: redact marked  e: replacement  /: find/filter  c: clear filter  q: quit"
-        )
+        subtitle = "space: mark  r: redact marked  m: meta  /: find/filter  c: clear  q: quit"
         tui_draw_header(stdscr, "ctxscrub Claude - session transcript", subtitle)
         filter_suffix = f"  filter={filter_text}" if filter_text else ""
+        meta_suffix = "  meta=on" if show_meta else "  meta=off"
         tui_write(
             stdscr,
             2,
             0,
-            f"{project_label(path)}  session={path.stem}  rows={row_count}  marked={selected_count}{filter_suffix}",
+            f"{project_label(path)}  session={path.stem}  rows={row_count}  blocks={len(visible_indexes)}  marked={selected_count}{meta_suffix}{filter_suffix}",
         )
 
         if not visible_indexes:
@@ -1093,18 +1180,27 @@ def tui_browse_transcript(stdscr, path: Path) -> tuple[list[TranscriptItem], str
         else:
             index = max(0, min(index, len(visible_indexes) - 1))
             visible_rows = max(1, height - 6)
-            max_visible_blocks = max(1, visible_rows // 3)
+            current_body_lines = max(3, visible_rows - 2)
+            compact_body_lines = 4
             if index < offset:
                 offset = index
-            if index >= offset + max_visible_blocks:
-                offset = index - max_visible_blocks + 1
+            offset = ensure_transcript_offset_visible(
+                selections,
+                visible_indexes,
+                index,
+                offset,
+                visible_rows,
+                width,
+                current_body_lines,
+                compact_body_lines,
+            )
             screen_row = 4
             for local_index, visible_idx in enumerate(visible_indexes[offset:], start=offset):
                 if screen_row >= height - 1:
                     break
                 selection = selections[visible_idx]
                 current = local_index == index
-                max_body_lines = 8 if current else 3
+                max_body_lines = current_body_lines if current else compact_body_lines
                 block_lines = render_transcript_block(
                     selection.item,
                     width,
@@ -1120,7 +1216,7 @@ def tui_browse_transcript(stdscr, path: Path) -> tuple[list[TranscriptItem], str
                     screen_row += 1
             tui_status(
                 stdscr,
-                "Readable block view. Only visible blocks are wrapped/rendered; marked blocks are redacted.",
+                "Readable view hides low-value metadata by default. Press m for forensic/meta blocks.",
             )
 
         key = stdscr.getch()
@@ -1148,16 +1244,36 @@ def tui_browse_transcript(stdscr, path: Path) -> tuple[list[TranscriptItem], str
                 visible_indexes = [
                     idx
                     for idx, selection in enumerate(selections)
-                    if query_lower in selection.item.title.lower()
-                    or query_lower in readable_transcript_body(selection.item).lower()
+                    if (show_meta or not is_low_value_transcript_item(selection.item))
+                    and (
+                        query_lower in selection.item.title.lower()
+                        or query_lower in readable_transcript_body(selection.item).lower()
+                    )
                 ]
             else:
-                visible_indexes = list(range(len(selections)))
+                visible_indexes = transcript_visible_indexes(selections, show_meta)
             index = 0
             offset = 0
         elif key == ord("c"):
             filter_text = ""
-            visible_indexes = list(range(len(selections)))
+            visible_indexes = transcript_visible_indexes(selections, show_meta)
+            index = 0
+            offset = 0
+        elif key == ord("m"):
+            show_meta = not show_meta
+            if filter_text:
+                query_lower = filter_text.lower()
+                visible_indexes = [
+                    idx
+                    for idx, selection in enumerate(selections)
+                    if (show_meta or not is_low_value_transcript_item(selection.item))
+                    and (
+                        query_lower in selection.item.title.lower()
+                        or query_lower in readable_transcript_body(selection.item).lower()
+                    )
+                ]
+            else:
+                visible_indexes = transcript_visible_indexes(selections, show_meta)
             index = 0
             offset = 0
         elif key == ord("r"):
@@ -1172,7 +1288,7 @@ def tui_browse_transcript(stdscr, path: Path) -> tuple[list[TranscriptItem], str
 
 
 def run_tui(stdscr, args: argparse.Namespace) -> None:
-    curses.curs_set(0)
+    tui_curs_set(0)
     stdscr.keypad(True)
     sessions = [p for p in iter_jsonl_files() if not is_subagent_path(p)]
     if args.project_contains:
