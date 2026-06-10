@@ -18,9 +18,11 @@ CLAUDE_PROJECTS = Path(os.environ.get("CTXSCRUB_CLAUDE_PROJECTS", Path.home() / 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_BACKUP_DIR = SCRIPT_DIR / "backups"
 AUDIT_LOG = SCRIPT_DIR / "audit.jsonl"
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 MIN_TUI_HEIGHT = 8
 MIN_TUI_WIDTH = 32
+SESSION_PREVIEW_LINE_LIMIT = 80
+SESSION_PREVIEW_BYTES_LIMIT = 256_000
 
 
 @dataclass
@@ -178,6 +180,33 @@ def compact_text(value: Any, width: int = 160) -> str:
     return text[: max(0, width - 1)] + "..."
 
 
+def first_preview_text(path: Path) -> str:
+    bytes_read = 0
+    with path.open("r", encoding="utf-8") as fh:
+        for line_no, line in enumerate(fh, start=1):
+            bytes_read += len(line.encode("utf-8", errors="ignore"))
+            if line_no > SESSION_PREVIEW_LINE_LIMIT or bytes_read > SESSION_PREVIEW_BYTES_LIMIT:
+                break
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            message = row.get("message") if isinstance(row.get("message"), dict) else {}
+            role = str(message.get("role") or row.get("type") or "")
+            if role not in {"user", "assistant"}:
+                continue
+            content = message.get("content")
+            if isinstance(content, str) and content.strip():
+                return compact_text(content, 72)
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
+                        text = part["text"].strip()
+                        if text:
+                            return compact_text(text, 72)
+    return ""
+
+
 def role_label(row: dict, content_part: Any | None = None) -> tuple[str, str]:
     role = row_role(row) or str(row.get("type") or "event")
     kind = str(row.get("type") or "event")
@@ -202,18 +231,13 @@ def row_title(row: dict, line_no: int, role: str, kind: str, body: Any) -> str:
 
 
 def session_display_name(path: Path) -> str:
-    rows = read_rows(path)
-    info = session_info(path)
-    when = datetime.fromtimestamp(info.mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
-    first_text = ""
-    for item in build_transcript(rows):
-        if item.role in {"user", "assistant"} and item.body:
-            first_text = compact_text(item.body, 72)
-            break
+    stat = path.stat()
+    when = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+    first_text = first_preview_text(path)
     label = project_label(path)
     if first_text:
         return f"{when}  {label}  {first_text}"
-    return f"{when}  {label}  {path.stem[:8]} rows={info.rows}"
+    return f"{when}  {label}  {path.stem[:8]} size={stat.st_size}"
 
 
 def build_transcript(rows: list[dict]) -> list[TranscriptItem]:
@@ -814,9 +838,25 @@ def tui_prompt(stdscr, prompt: str) -> str:
     return raw.decode("utf-8", errors="replace").strip()
 
 
+class SessionLabelCache:
+    def __init__(self) -> None:
+        self._labels: dict[Path, tuple[float, int, str]] = {}
+
+    def label_for(self, path: Path) -> str:
+        stat = path.stat()
+        cached = self._labels.get(path)
+        key = (stat.st_mtime, stat.st_size)
+        if cached and cached[:2] == key:
+            return cached[2]
+        label = session_display_name(path)
+        self._labels[path] = (*key, label)
+        return label
+
+
 def tui_select_session(stdscr, sessions: list[Path]) -> Path | None:
     index = 0
     offset = 0
+    label_cache = SessionLabelCache()
     while True:
         stdscr.erase()
         if not tui_check_size(stdscr):
@@ -832,10 +872,10 @@ def tui_select_session(stdscr, sessions: list[Path]) -> Path | None:
             offset = index - visible_rows + 1
         for screen_row, path in enumerate(sessions[offset : offset + visible_rows], start=2):
             marker = ">" if offset + screen_row - 2 == index else " "
-            label = f"{marker} {session_display_name(path)}"
+            label = f"{marker} {label_cache.label_for(path)}"
             attr = curses.A_REVERSE if marker == ">" else curses.A_NORMAL
             tui_write(stdscr, screen_row, 0, label, attr)
-        tui_status(stdscr, f"{len(sessions)} sessions. Subagents hidden by default.")
+        tui_status(stdscr, f"{len(sessions)} sessions. Lazy labels: only visible rows are loaded.")
         key = stdscr.getch()
         if key in (ord("q"), 27):
             return None
@@ -923,7 +963,9 @@ def render_transcript_line(item: TranscriptItem, width: int) -> str:
 
 
 def tui_browse_transcript(stdscr, path: Path) -> tuple[list[TranscriptItem], str] | None:
-    selections = [TranscriptSelection(item=item, selected=False) for item in build_transcript(read_rows(path))]
+    rows = read_rows(path)
+    row_count = len(rows)
+    selections = [TranscriptSelection(item=item, selected=False) for item in build_transcript(rows)]
     visible_indexes = list(range(len(selections)))
     index = 0
     offset = 0
@@ -942,13 +984,12 @@ def tui_browse_transcript(stdscr, path: Path) -> tuple[list[TranscriptItem], str
             "space: mark  r: redact marked  e: replacement  /: find/filter  c: clear filter  q: quit"
         )
         tui_draw_header(stdscr, "ctxscrub Claude - session transcript", subtitle)
-        info = session_info(path)
         filter_suffix = f"  filter={filter_text}" if filter_text else ""
         tui_write(
             stdscr,
             2,
             0,
-            f"{project_label(path)}  session={path.stem}  rows={info.rows}  marked={selected_count}{filter_suffix}",
+            f"{project_label(path)}  session={path.stem}  rows={row_count}  marked={selected_count}{filter_suffix}",
         )
 
         if not visible_indexes:

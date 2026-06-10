@@ -105,6 +105,17 @@ class CtxScrubClaudeTests(unittest.TestCase):
         self.assertIn("/tmp/SECRET_BETA.txt", transcript[2].body)
         self.assertEqual(transcript[2].role, "tool call")
 
+    def test_session_display_name_uses_bounded_preview(self) -> None:
+        path = Path(self.tmp.name) / "preview-session.jsonl"
+        first_row = {
+            "type": "user",
+            "uuid": "preview-u1",
+            "message": {"role": "user", "content": "first useful session label"},
+        }
+        path.write_text(json.dumps(first_row) + "\n{not valid later json\n", encoding="utf-8")
+        label = self.mod.session_display_name(path)
+        self.assertIn("first useful session label", label)
+
     def test_transcript_redaction_replaces_marked_block_only(self) -> None:
         rows = self.mod.read_rows(self.path)
         transcript = self.mod.build_transcript(rows)
