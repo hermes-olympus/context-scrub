@@ -8,6 +8,7 @@ import curses
 import json
 import os
 import shutil
+import textwrap
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,7 +19,7 @@ CLAUDE_PROJECTS = Path(os.environ.get("CTXSCRUB_CLAUDE_PROJECTS", Path.home() / 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_BACKUP_DIR = SCRIPT_DIR / "backups"
 AUDIT_LOG = SCRIPT_DIR / "audit.jsonl"
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 MIN_TUI_HEIGHT = 8
 MIN_TUI_WIDTH = 32
 SESSION_PREVIEW_LINE_LIMIT = 80
@@ -957,9 +958,44 @@ def tui_review_matches(stdscr, path: Path, query: str, matches: list[Match]) -> 
                 return chosen, replacement
 
 
-def render_transcript_line(item: TranscriptItem, width: int) -> str:
-    body_width = max(20, width - len(item.title) - 12)
-    return f"{item.title} :: {compact_text(item.body, body_width)}"
+def wrap_display_text(text: str, width: int, max_lines: int) -> list[str]:
+    clean = text.replace("\t", "    ")
+    wrapped: list[str] = []
+    for paragraph in clean.splitlines() or [clean]:
+        paragraph = paragraph.strip()
+        if not paragraph:
+            if wrapped:
+                wrapped.append("")
+            continue
+        wrapped.extend(textwrap.wrap(paragraph, width=max(20, width), replace_whitespace=False))
+        if len(wrapped) >= max_lines:
+            break
+    if len(wrapped) > max_lines:
+        wrapped = wrapped[:max_lines]
+    if not wrapped:
+        wrapped = [""]
+    source_line_count = sum(max(1, len(textwrap.wrap(line.strip(), width=max(20, width)))) for line in clean.splitlines() or [clean])
+    if source_line_count > max_lines:
+        wrapped[-1] = compact_text(wrapped[-1], max(20, width - 4)) + " ..."
+    return wrapped
+
+
+def render_transcript_block(
+    item: TranscriptItem,
+    width: int,
+    current: bool,
+    selected: bool,
+    max_body_lines: int,
+) -> list[str]:
+    marker = ">" if current else " "
+    checkbox = "[x]" if selected else "[ ]"
+    header = compact_text(f"{marker} {checkbox} {item.title}", width)
+    body_width = max(20, width - 4)
+    body_lines = wrap_display_text(str(item.body), body_width, max_body_lines)
+    rendered = [header]
+    rendered.extend(f"    {line}" for line in body_lines)
+    rendered.append("")
+    return rendered
 
 
 def tui_browse_transcript(stdscr, path: Path) -> tuple[list[TranscriptItem], str] | None:
@@ -998,20 +1034,34 @@ def tui_browse_transcript(stdscr, path: Path) -> tuple[list[TranscriptItem], str
         else:
             index = max(0, min(index, len(visible_indexes) - 1))
             visible_rows = max(1, height - 6)
+            max_visible_blocks = max(1, visible_rows // 3)
             if index < offset:
                 offset = index
-            if index >= offset + visible_rows:
-                offset = index - visible_rows + 1
-            for screen_row, visible_idx in enumerate(visible_indexes[offset : offset + visible_rows], start=4):
+            if index >= offset + max_visible_blocks:
+                offset = index - max_visible_blocks + 1
+            screen_row = 4
+            for local_index, visible_idx in enumerate(visible_indexes[offset:], start=offset):
+                if screen_row >= height - 1:
+                    break
                 selection = selections[visible_idx]
-                selected = "[x]" if selection.selected else "[ ]"
-                marker = ">" if offset + screen_row - 4 == index else " "
-                label = f"{marker} {selected} {render_transcript_line(selection.item, width)}"
-                attr = curses.A_REVERSE if marker == ">" else curses.A_NORMAL
-                tui_write(stdscr, screen_row, 0, label, attr)
+                current = local_index == index
+                max_body_lines = 8 if current else 3
+                block_lines = render_transcript_block(
+                    selection.item,
+                    width,
+                    current=current,
+                    selected=selection.selected,
+                    max_body_lines=max_body_lines,
+                )
+                for block_line_index, line in enumerate(block_lines):
+                    if screen_row >= height - 1:
+                        break
+                    attr = curses.A_REVERSE if current and block_line_index == 0 else curses.A_NORMAL
+                    tui_write(stdscr, screen_row, 0, line, attr)
+                    screen_row += 1
             tui_status(
                 stdscr,
-                "Browse the actual session history. Mark only blocks you want replaced; backups are created.",
+                "Readable block view. Only visible blocks are wrapped/rendered; marked blocks are redacted.",
             )
 
         key = stdscr.getch()

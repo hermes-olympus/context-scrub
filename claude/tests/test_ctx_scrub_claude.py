@@ -116,6 +116,20 @@ class CtxScrubClaudeTests(unittest.TestCase):
         label = self.mod.session_display_name(path)
         self.assertIn("first useful session label", label)
 
+    def test_transcript_block_renderer_wraps_readable_body(self) -> None:
+        item = self.mod.TranscriptItem(
+            line_no=7,
+            role="assistant",
+            kind="text",
+            uuid="a7",
+            field_path="$.message.content",
+            title="line 7 assistant / text",
+            body="This is a longer answer that should wrap onto multiple body lines instead of becoming one unreadable row.",
+        )
+        lines = self.mod.render_transcript_block(item, width=52, current=True, selected=False, max_body_lines=4)
+        self.assertTrue(lines[0].startswith("> [ ] line 7 assistant"))
+        self.assertGreaterEqual(len([line for line in lines if line.startswith("    ")]), 2)
+
     def test_transcript_redaction_replaces_marked_block_only(self) -> None:
         rows = self.mod.read_rows(self.path)
         transcript = self.mod.build_transcript(rows)
