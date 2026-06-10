@@ -19,7 +19,7 @@ CLAUDE_PROJECTS = Path(os.environ.get("CTXSCRUB_CLAUDE_PROJECTS", Path.home() / 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_BACKUP_DIR = SCRIPT_DIR / "backups"
 AUDIT_LOG = SCRIPT_DIR / "audit.jsonl"
-VERSION = "0.3.2"
+VERSION = "0.3.3"
 MIN_TUI_HEIGHT = 8
 MIN_TUI_WIDTH = 32
 SESSION_PREVIEW_LINE_LIMIT = 80
@@ -74,7 +74,7 @@ class TranscriptItem:
     uuid: str
     field_path: str
     title: str
-    body: str
+    body: Any
 
 
 @dataclass
@@ -223,12 +223,64 @@ def role_label(row: dict, content_part: Any | None = None) -> tuple[str, str]:
 
 
 def row_title(row: dict, line_no: int, role: str, kind: str, body: Any) -> str:
-    prefix = f"line {line_no} {role}"
-    if kind and kind != role:
-        prefix += f" / {kind}"
+    label = {
+        "user": "USER",
+        "assistant": "ASSISTANT",
+        "tool call": "TOOL",
+        "tool result": "RESULT",
+        "last-prompt": "LAST PROMPT",
+        "summary": "SUMMARY",
+    }.get(role, role.upper())
+    if kind in {"lastPrompt", "summary", "toolUseResult"}:
+        label = {
+            "lastPrompt": "LAST PROMPT",
+            "summary": "SUMMARY",
+            "toolUseResult": "TOOL RESULT",
+        }[kind]
     if isinstance(body, dict) and body.get("name"):
-        prefix += f" / {body.get('name')}"
-    return prefix
+        return f"{label} {body.get('name')}  line {line_no}"
+    return f"{label}  line {line_no}"
+
+
+def readable_tool_body(value: dict) -> str:
+    title = str(value.get("name") or value.get("type") or "tool")
+    lines = [title]
+    if value.get("id"):
+        lines.append(f"id: {value.get('id')}")
+    tool_input = value.get("input")
+    if tool_input not in (None, "", {}, []):
+        lines.append("input:")
+        lines.append(json.dumps(tool_input, ensure_ascii=False, indent=2, sort_keys=True))
+    other = {key: item for key, item in value.items() if key not in {"type", "name", "id", "input"}}
+    if other:
+        lines.append("details:")
+        lines.append(json.dumps(other, ensure_ascii=False, indent=2, sort_keys=True))
+    return "\n".join(lines)
+
+
+def readable_tool_result_body(value: dict) -> str:
+    content = value.get("content")
+    if isinstance(content, str):
+        return content
+    if content not in (None, "", [], {}):
+        return json.dumps(content, ensure_ascii=False, indent=2, sort_keys=True)
+    other = {key: item for key, item in value.items() if key not in {"type", "tool_use_id", "is_error"}}
+    if other:
+        return json.dumps(other, ensure_ascii=False, indent=2, sort_keys=True)
+    return compact_text(value, 2000)
+
+
+def readable_transcript_body(item: TranscriptItem) -> str:
+    body = item.body
+    if isinstance(body, str):
+        return body
+    if isinstance(body, dict):
+        if body.get("type") == "tool_use":
+            return readable_tool_body(body)
+        if body.get("type") == "tool_result":
+            return readable_tool_result_body(body)
+        return json.dumps(body, ensure_ascii=False, indent=2, sort_keys=True)
+    return json.dumps(body, ensure_ascii=False, indent=2, sort_keys=True)
 
 
 def session_display_name(path: Path) -> str:
@@ -282,7 +334,7 @@ def build_transcript(rows: list[dict]) -> list[TranscriptItem]:
                         uuid=uuid,
                         field_path=field_path,
                         title=row_title(row, line_no, role, kind, body),
-                        body=compact_text(body, 2000),
+                        body=body,
                     )
                 )
             continue
@@ -299,7 +351,7 @@ def build_transcript(rows: list[dict]) -> list[TranscriptItem]:
                         uuid=uuid,
                         field_path=f"$.{key}",
                         title=row_title(row, line_no, role, key, body),
-                        body=compact_text(body, 2000),
+                        body=body,
                     )
                 )
                 break
@@ -313,7 +365,7 @@ def build_transcript(rows: list[dict]) -> list[TranscriptItem]:
                     uuid=uuid,
                     field_path="$",
                     title=row_title(row, line_no, role, kind, row),
-                    body=compact_text(row, 2000),
+                    body=row,
                 )
             )
     return items
@@ -961,20 +1013,27 @@ def tui_review_matches(stdscr, path: Path, query: str, matches: list[Match]) -> 
 def wrap_display_text(text: str, width: int, max_lines: int) -> list[str]:
     clean = text.replace("\t", "    ")
     wrapped: list[str] = []
-    for paragraph in clean.splitlines() or [clean]:
-        paragraph = paragraph.strip()
-        if not paragraph:
+    wrap_width = max(20, width)
+    for line in clean.splitlines() or [clean]:
+        if not line.strip():
             if wrapped:
                 wrapped.append("")
             continue
-        wrapped.extend(textwrap.wrap(paragraph, width=max(20, width), replace_whitespace=False))
+        line_chunks = textwrap.wrap(
+            line,
+            width=wrap_width,
+            replace_whitespace=False,
+            drop_whitespace=False,
+            subsequent_indent="  ",
+        )
+        wrapped.extend(chunk.rstrip() for chunk in line_chunks)
         if len(wrapped) >= max_lines:
             break
     if len(wrapped) > max_lines:
         wrapped = wrapped[:max_lines]
     if not wrapped:
         wrapped = [""]
-    source_line_count = sum(max(1, len(textwrap.wrap(line.strip(), width=max(20, width)))) for line in clean.splitlines() or [clean])
+    source_line_count = sum(max(1, len(textwrap.wrap(line, width=wrap_width))) for line in clean.splitlines() or [clean])
     if source_line_count > max_lines:
         wrapped[-1] = compact_text(wrapped[-1], max(20, width - 4)) + " ..."
     return wrapped
@@ -991,7 +1050,7 @@ def render_transcript_block(
     checkbox = "[x]" if selected else "[ ]"
     header = compact_text(f"{marker} {checkbox} {item.title}", width)
     body_width = max(20, width - 4)
-    body_lines = wrap_display_text(str(item.body), body_width, max_body_lines)
+    body_lines = wrap_display_text(readable_transcript_body(item), body_width, max_body_lines)
     rendered = [header]
     rendered.extend(f"    {line}" for line in body_lines)
     rendered.append("")
@@ -1089,7 +1148,8 @@ def tui_browse_transcript(stdscr, path: Path) -> tuple[list[TranscriptItem], str
                 visible_indexes = [
                     idx
                     for idx, selection in enumerate(selections)
-                    if query_lower in selection.item.title.lower() or query_lower in selection.item.body.lower()
+                    if query_lower in selection.item.title.lower()
+                    or query_lower in readable_transcript_body(selection.item).lower()
                 ]
             else:
                 visible_indexes = list(range(len(selections)))

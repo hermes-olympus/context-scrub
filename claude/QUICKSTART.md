@@ -27,7 +27,7 @@ Keys:
 - `r`: redact marked blocks
 - `q`: quit
 
-The default TUI does not ask for a word first. It opens the selected session as a readable transcript, including user messages, assistant messages, tool calls, and tool results. Mark the blocks you want removed, then redact them in one batch.
+The default TUI does not ask for a word first. It opens the selected session as a readable transcript, including user messages, assistant messages, tool calls, and tool results. Messages wrap like normal reading text, while tool calls/results keep structured inputs and outputs readable. Mark the blocks you want removed, then redact them in one batch.
 
 For the older exact-text match review, launch with:
 

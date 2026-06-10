@@ -102,7 +102,7 @@ class CtxScrubClaudeTests(unittest.TestCase):
         transcript = self.mod.build_transcript(rows)
         self.assertEqual([item.kind for item in transcript], ["text", "text", "tool_use", "lastPrompt"])
         self.assertIn("remove SECRET_BETA", transcript[0].body)
-        self.assertIn("/tmp/SECRET_BETA.txt", transcript[2].body)
+        self.assertIn("/tmp/SECRET_BETA.txt", self.mod.readable_transcript_body(transcript[2]))
         self.assertEqual(transcript[2].role, "tool call")
 
     def test_session_display_name_uses_bounded_preview(self) -> None:
@@ -123,12 +123,28 @@ class CtxScrubClaudeTests(unittest.TestCase):
             kind="text",
             uuid="a7",
             field_path="$.message.content",
-            title="line 7 assistant / text",
+            title=self.mod.row_title({}, 7, "assistant", "text", ""),
             body="This is a longer answer that should wrap onto multiple body lines instead of becoming one unreadable row.",
         )
         lines = self.mod.render_transcript_block(item, width=52, current=True, selected=False, max_body_lines=4)
-        self.assertTrue(lines[0].startswith("> [ ] line 7 assistant"))
+        self.assertTrue(lines[0].startswith("> [ ] ASSISTANT"))
         self.assertGreaterEqual(len([line for line in lines if line.startswith("    ")]), 2)
+
+    def test_tool_block_renderer_shows_structured_input(self) -> None:
+        item = self.mod.TranscriptItem(
+            line_no=8,
+            role="tool call",
+            kind="tool_use",
+            uuid="tool-8",
+            field_path="$.message.content[1]",
+            title="TOOL Read  line 8",
+            body={"type": "tool_use", "name": "Read", "input": {"file_path": "/tmp/SECRET_BETA.txt"}},
+        )
+        lines = self.mod.render_transcript_block(item, width=70, current=True, selected=False, max_body_lines=8)
+        text = "\n".join(lines)
+        self.assertIn("TOOL Read", lines[0])
+        self.assertIn("input:", text)
+        self.assertIn("file_path", text)
 
     def test_transcript_redaction_replaces_marked_block_only(self) -> None:
         rows = self.mod.read_rows(self.path)
