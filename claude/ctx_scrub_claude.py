@@ -18,7 +18,7 @@ CLAUDE_PROJECTS = Path(os.environ.get("CTXSCRUB_CLAUDE_PROJECTS", Path.home() / 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_BACKUP_DIR = SCRIPT_DIR / "backups"
 AUDIT_LOG = SCRIPT_DIR / "audit.jsonl"
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 MIN_TUI_HEIGHT = 8
 MIN_TUI_WIDTH = 32
 
@@ -60,6 +60,23 @@ class Match:
 @dataclass
 class MatchSelection:
     match: Match
+    selected: bool = False
+
+
+@dataclass
+class TranscriptItem:
+    line_no: int
+    role: str
+    kind: str
+    uuid: str
+    field_path: str
+    title: str
+    body: str
+
+
+@dataclass
+class TranscriptSelection:
+    item: TranscriptItem
     selected: bool = False
 
 
@@ -150,6 +167,133 @@ def short_snippet(value: str, query: str, width: int = 90) -> str:
     return one_line[start:end]
 
 
+def compact_text(value: Any, width: int = 160) -> str:
+    if isinstance(value, str):
+        text = value
+    else:
+        text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    text = " ".join(text.replace("\n", " ").split())
+    if len(text) <= width:
+        return text
+    return text[: max(0, width - 1)] + "..."
+
+
+def role_label(row: dict, content_part: Any | None = None) -> tuple[str, str]:
+    role = row_role(row) or str(row.get("type") or "event")
+    kind = str(row.get("type") or "event")
+    if isinstance(content_part, dict):
+        part_type = str(content_part.get("type") or "")
+        if part_type:
+            kind = part_type
+        if part_type == "tool_use":
+            role = "tool call"
+        elif part_type == "tool_result":
+            role = "tool result"
+    return role, kind
+
+
+def row_title(row: dict, line_no: int, role: str, kind: str, body: Any) -> str:
+    prefix = f"line {line_no} {role}"
+    if kind and kind != role:
+        prefix += f" / {kind}"
+    if isinstance(body, dict) and body.get("name"):
+        prefix += f" / {body.get('name')}"
+    return prefix
+
+
+def session_display_name(path: Path) -> str:
+    rows = read_rows(path)
+    info = session_info(path)
+    when = datetime.fromtimestamp(info.mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+    first_text = ""
+    for item in build_transcript(rows):
+        if item.role in {"user", "assistant"} and item.body:
+            first_text = compact_text(item.body, 72)
+            break
+    label = project_label(path)
+    if first_text:
+        return f"{when}  {label}  {first_text}"
+    return f"{when}  {label}  {path.stem[:8]} rows={info.rows}"
+
+
+def build_transcript(rows: list[dict]) -> list[TranscriptItem]:
+    items: list[TranscriptItem] = []
+    for line_no, row in enumerate(rows, start=1):
+        uuid = str(row.get("uuid") or "")
+        message = row.get("message") if isinstance(row.get("message"), dict) else {}
+        content = message.get("content") if message else None
+        if isinstance(content, str):
+            role, kind = role_label(row)
+            items.append(
+                TranscriptItem(
+                    line_no=line_no,
+                    role=role,
+                    kind="text",
+                    uuid=uuid,
+                    field_path="$.message.content",
+                    title=row_title(row, line_no, role, "text", content),
+                    body=content,
+                )
+            )
+            continue
+        if isinstance(content, list):
+            for idx, part in enumerate(content):
+                role, kind = role_label(row, part)
+                if isinstance(part, dict):
+                    if part.get("type") == "text" and isinstance(part.get("text"), str):
+                        body = part["text"]
+                        field_path = f"$.message.content[{idx}].text"
+                    else:
+                        body = part
+                        field_path = f"$.message.content[{idx}]"
+                else:
+                    body = part
+                    field_path = f"$.message.content[{idx}]"
+                items.append(
+                    TranscriptItem(
+                        line_no=line_no,
+                        role=role,
+                        kind=kind,
+                        uuid=uuid,
+                        field_path=field_path,
+                        title=row_title(row, line_no, role, kind, body),
+                        body=compact_text(body, 2000),
+                    )
+                )
+            continue
+
+        for key in ("lastPrompt", "summary", "toolUseResult"):
+            if key in row:
+                role, kind = role_label(row)
+                body = row[key]
+                items.append(
+                    TranscriptItem(
+                        line_no=line_no,
+                        role=role,
+                        kind=key,
+                        uuid=uuid,
+                        field_path=f"$.{key}",
+                        title=row_title(row, line_no, role, key, body),
+                        body=compact_text(body, 2000),
+                    )
+                )
+                break
+        else:
+            role, kind = role_label(row)
+            items.append(
+                TranscriptItem(
+                    line_no=line_no,
+                    role=role,
+                    kind=kind,
+                    uuid=uuid,
+                    field_path="$",
+                    title=row_title(row, line_no, role, kind, row),
+                    body=compact_text(row, 2000),
+                )
+            )
+    return items
+
+
 def iter_string_values(value: Any, prefix: str = "$"):
     if isinstance(value, str):
         yield prefix, value
@@ -213,6 +357,8 @@ def get_path_value(value: Any, tokens: list[str | int]) -> Any:
 
 
 def set_path_value(value: Any, tokens: list[str | int], new_value: Any) -> None:
+    if not tokens:
+        raise ValueError("Refusing to replace the whole JSONL row")
     current = value
     for token in tokens[:-1]:
         current = current[token]
@@ -233,6 +379,54 @@ def redact_selected_matches(rows: list[dict], query: str, replacement: str, sele
             count = value.count(query)
             if count:
                 set_path_value(new_row, tokens, value.replace(query, replacement))
+                total += count
+        redacted_rows.append(new_row)
+    return redacted_rows, total
+
+
+def redacted_value(value: Any, replacement: str) -> tuple[Any, int]:
+    if isinstance(value, str):
+        return replacement, 1
+    if isinstance(value, list):
+        new_items = []
+        total = 0
+        for item in value:
+            new_item, count = redacted_value(item, replacement)
+            new_items.append(new_item)
+            total += count
+        return new_items, total
+    if isinstance(value, dict):
+        new_obj = {}
+        total = 0
+        for key, item in value.items():
+            if key in {"type", "name", "id"}:
+                new_obj[key] = item
+                continue
+            new_item, count = redacted_value(item, replacement)
+            new_obj[key] = new_item
+            total += count
+        return new_obj, total
+    if value is None:
+        return value, 0
+    return replacement, 1
+
+
+def redact_selected_transcript_items(
+    rows: list[dict], replacement: str, selections: list[TranscriptItem]
+) -> tuple[list[dict], int]:
+    by_line_and_path = {(selection.line_no, selection.field_path) for selection in selections}
+    redacted_rows: list[dict] = []
+    total = 0
+    for line_no, row in enumerate(rows, start=1):
+        new_row = json.loads(json_dumps(row))
+        for _, field_path in [item for item in by_line_and_path if item[0] == line_no]:
+            if field_path == "$":
+                continue
+            tokens = parse_field_path(field_path)
+            value = get_path_value(new_row, tokens)
+            new_value, count = redacted_value(value, replacement)
+            if count:
+                set_path_value(new_row, tokens, new_value)
                 total += count
         redacted_rows.append(new_row)
     return redacted_rows, total
@@ -458,6 +652,56 @@ def apply_selected_redaction(
     return count, backup
 
 
+def apply_transcript_redaction(
+    path: Path,
+    replacement: str,
+    selections: list[TranscriptItem],
+    backup_dir: str | None,
+    recent_threshold_seconds: int,
+    allow_recent: bool,
+) -> tuple[int, Path]:
+    assert_not_recently_modified(path, recent_threshold_seconds, allow_recent)
+    rows = read_rows(path)
+    new_rows, count = redact_selected_transcript_items(rows, replacement, selections)
+    if count == 0:
+        return 0, Path("")
+
+    backup = backup_file(path, backup_dir)
+    write_rows(path, new_rows)
+    verified_rows = read_rows(path)
+    _, missing = validate_parent_chain(verified_rows)
+    selected_keys = {(selection.line_no, selection.field_path) for selection in selections}
+    remaining_selected = [
+        item
+        for item in build_transcript(verified_rows)
+        if (item.line_no, item.field_path) in selected_keys and replacement not in item.body
+    ]
+    if missing or remaining_selected:
+        shutil.copy2(backup, path)
+        audit(
+            "transcript_redact_failed_restored",
+            path=str(path),
+            backup=str(backup),
+            replacement=replacement,
+            missing_parent_refs=missing,
+            remaining_selected=len(remaining_selected),
+        )
+        raise SystemExit(
+            "Transcript redaction verification failed; restored backup. "
+            f"missing_parent_refs={missing} remaining_selected={len(remaining_selected)}"
+        )
+    audit(
+        "transcript_redact",
+        path=str(path),
+        backup=str(backup),
+        selected_items=len(selections),
+        redacted_values=count,
+        replacement=replacement,
+        session_id=path.stem,
+    )
+    return count, backup
+
+
 def cmd_redact(args: argparse.Namespace) -> None:
     replacement = args.replacement or "[CTX_SCRUB_REDACTED]"
     for path in select_paths(args):
@@ -580,17 +824,15 @@ def tui_select_session(stdscr, sessions: list[Path]) -> Path | None:
                 return None
             continue
         height, width = stdscr.getmaxyx()
-        tui_draw_header(stdscr, "ctxscrub Claude - choose session", "Enter: select  j/k/arrows: move  /: filter  q: quit")
+        tui_draw_header(stdscr, "ctxscrub Claude - choose session", "Enter: open  j/k/arrows: move  /: filter  q: quit")
         visible_rows = max(1, height - 4)
         if index < offset:
             offset = index
         if index >= offset + visible_rows:
             offset = index - visible_rows + 1
         for screen_row, path in enumerate(sessions[offset : offset + visible_rows], start=2):
-            info = session_info(path)
-            when = datetime.fromtimestamp(info.mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
             marker = ">" if offset + screen_row - 2 == index else " "
-            label = f"{marker} {when} rows={info.rows} {path.stem[:8]} {project_label(path)}"
+            label = f"{marker} {session_display_name(path)}"
             attr = curses.A_REVERSE if marker == ">" else curses.A_NORMAL
             tui_write(stdscr, screen_row, 0, label, attr)
         tui_status(stdscr, f"{len(sessions)} sessions. Subagents hidden by default.")
@@ -675,6 +917,109 @@ def tui_review_matches(stdscr, path: Path, query: str, matches: list[Match]) -> 
                 return chosen, replacement
 
 
+def render_transcript_line(item: TranscriptItem, width: int) -> str:
+    body_width = max(20, width - len(item.title) - 12)
+    return f"{item.title} :: {compact_text(item.body, body_width)}"
+
+
+def tui_browse_transcript(stdscr, path: Path) -> tuple[list[TranscriptItem], str] | None:
+    selections = [TranscriptSelection(item=item, selected=False) for item in build_transcript(read_rows(path))]
+    visible_indexes = list(range(len(selections)))
+    index = 0
+    offset = 0
+    replacement = "[CTX_SCRUB_REDACTED]"
+    filter_text = ""
+
+    while True:
+        stdscr.erase()
+        if not tui_check_size(stdscr):
+            if stdscr.getch() in (ord("q"), 27):
+                return None
+            continue
+        height, width = stdscr.getmaxyx()
+        selected_count = sum(1 for item in selections if item.selected)
+        subtitle = (
+            "space: mark  r: redact marked  e: replacement  /: find/filter  c: clear filter  q: quit"
+        )
+        tui_draw_header(stdscr, "ctxscrub Claude - session transcript", subtitle)
+        info = session_info(path)
+        filter_suffix = f"  filter={filter_text}" if filter_text else ""
+        tui_write(
+            stdscr,
+            2,
+            0,
+            f"{project_label(path)}  session={path.stem}  rows={info.rows}  marked={selected_count}{filter_suffix}",
+        )
+
+        if not visible_indexes:
+            tui_write(stdscr, 4, 0, "No transcript blocks match the current filter.")
+            tui_status(stdscr, "Press c to clear filter, / to search again, or q to quit.")
+        else:
+            index = max(0, min(index, len(visible_indexes) - 1))
+            visible_rows = max(1, height - 6)
+            if index < offset:
+                offset = index
+            if index >= offset + visible_rows:
+                offset = index - visible_rows + 1
+            for screen_row, visible_idx in enumerate(visible_indexes[offset : offset + visible_rows], start=4):
+                selection = selections[visible_idx]
+                selected = "[x]" if selection.selected else "[ ]"
+                marker = ">" if offset + screen_row - 4 == index else " "
+                label = f"{marker} {selected} {render_transcript_line(selection.item, width)}"
+                attr = curses.A_REVERSE if marker == ">" else curses.A_NORMAL
+                tui_write(stdscr, screen_row, 0, label, attr)
+            tui_status(
+                stdscr,
+                "Browse the actual session history. Mark only blocks you want replaced; backups are created.",
+            )
+
+        key = stdscr.getch()
+        if key in (ord("q"), 27):
+            return None
+        if key in (curses.KEY_DOWN, ord("j")) and index < len(visible_indexes) - 1:
+            index += 1
+        elif key in (curses.KEY_UP, ord("k")) and index > 0:
+            index -= 1
+        elif key == curses.KEY_NPAGE:
+            index = min(len(visible_indexes) - 1, index + max(1, height - 6))
+        elif key == curses.KEY_PPAGE:
+            index = max(0, index - max(1, height - 6))
+        elif key == ord(" ") and visible_indexes:
+            selections[visible_indexes[index]].selected = not selections[visible_indexes[index]].selected
+        elif key == ord("e"):
+            new_replacement = tui_prompt(stdscr, "replacement: ")
+            if new_replacement:
+                replacement = new_replacement
+        elif key == ord("/"):
+            query = tui_prompt(stdscr, "find/filter transcript: ")
+            filter_text = query
+            if query:
+                query_lower = query.lower()
+                visible_indexes = [
+                    idx
+                    for idx, selection in enumerate(selections)
+                    if query_lower in selection.item.title.lower() or query_lower in selection.item.body.lower()
+                ]
+            else:
+                visible_indexes = list(range(len(selections)))
+            index = 0
+            offset = 0
+        elif key == ord("c"):
+            filter_text = ""
+            visible_indexes = list(range(len(selections)))
+            index = 0
+            offset = 0
+        elif key == ord("r"):
+            chosen = [item.item for item in selections if item.selected]
+            if not chosen:
+                tui_status(stdscr, "No transcript blocks marked. Press any key.")
+                stdscr.getch()
+                continue
+            confirm = tui_prompt(stdscr, f"Type REDACT to replace {len(chosen)} marked blocks: ")
+            if confirm == "REDACT":
+                return chosen, replacement
+
+
 def run_tui(stdscr, args: argparse.Namespace) -> None:
     curses.curs_set(0)
     stdscr.keypad(True)
@@ -686,36 +1031,52 @@ def run_tui(stdscr, args: argparse.Namespace) -> None:
     selected_session = tui_select_session(stdscr, sessions)
     if selected_session is None:
         return
-    query = args.query or tui_prompt(stdscr, "text to find/redact: ")
-    if not query:
-        return
-    matches = search_text(selected_session, query)
-    if not matches:
-        stdscr.erase()
-        tui_draw_header(stdscr, "ctxscrub Claude", "No matches found. Press any key.")
-        stdscr.getch()
-        return
-    review = tui_review_matches(stdscr, selected_session, query, matches)
+    if args.query:
+        matches = search_text(selected_session, args.query)
+        if not matches:
+            stdscr.erase()
+            tui_draw_header(stdscr, "ctxscrub Claude", "No matches found. Press any key.")
+            stdscr.getch()
+            return
+        review = tui_review_matches(stdscr, selected_session, args.query, matches)
+        if review is None:
+            return
+        chosen, replacement = review
+        applied, backup = apply_selected_redaction(
+            selected_session,
+            args.query,
+            replacement,
+            chosen,
+            args.backup_dir,
+            args.recent_threshold_seconds,
+            args.allow_recent,
+        )
+        remaining_text = f"Remaining matches for query: {len(search_text(selected_session, args.query))}"
+        selected_label = f"Selected fields: {len(chosen)}"
+    else:
+        review = tui_browse_transcript(stdscr, selected_session)
+        if review is None:
+            return
+        chosen, replacement = review
+        applied, backup = apply_transcript_redaction(
+            selected_session,
+            replacement,
+            chosen,
+            args.backup_dir,
+            args.recent_threshold_seconds,
+            args.allow_recent,
+        )
+        remaining_text = "Transcript blocks redacted by selection."
+        selected_label = f"Marked blocks: {len(chosen)}"
     if review is None:
         return
-    chosen, replacement = review
-    applied, backup = apply_selected_redaction(
-        selected_session,
-        query,
-        replacement,
-        chosen,
-        args.backup_dir,
-        args.recent_threshold_seconds,
-        args.allow_recent,
-    )
-    remaining = search_text(selected_session, query)
     stdscr.erase()
     tui_draw_header(stdscr, "ctxscrub Claude - redaction complete")
     lines = [
-        f"Applied replacements: {applied}",
-        f"Selected fields: {len(chosen)}",
+        f"Redacted values: {applied}",
+        selected_label,
         f"Backup: {backup}",
-        f"Remaining matches for query: {len(remaining)}",
+        remaining_text,
         "",
         "Press any key to exit.",
     ]

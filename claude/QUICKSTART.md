@@ -1,4 +1,4 @@
-# ctx-scrub Claude v0.2 Quickstart
+# ctx-scrub Claude v0.3 Quickstart
 
 Use this flow for a real Claude Code project.
 
@@ -20,12 +20,20 @@ Keys:
 - `j/k` or arrow keys: move
 - `/`: filter sessions
 - `Enter`: choose session
-- `space`: mark/unmark match
-- `a`: select all matches
-- `n`: select none
+- `space`: mark/unmark transcript block
+- `/`: find/filter inside the session transcript
+- `c`: clear transcript filter
 - `e`: edit replacement marker
-- `r`: redact selected matches
+- `r`: redact marked blocks
 - `q`: quit
+
+The default TUI does not ask for a word first. It opens the selected session as a readable transcript, including user messages, assistant messages, tool calls, and tool results. Mark the blocks you want removed, then redact them in one batch.
+
+For the older exact-text match review, launch with:
+
+```bash
+./ctxscrub --query "text to remove"
+```
 
 ## 3. Scriptable Flow
 
@@ -72,7 +80,7 @@ Apply:
 ./ctx_scrub_claude.py redact --session-id <session-id> --query "text to remove" --apply
 ```
 
-If Claude Code just wrote to the file, v0.1 refuses to mutate it for 15 seconds by default. Wait a moment, close/pause Claude Code, or explicitly override only if you know the session is not being written:
+If Claude Code just wrote to the file, ctx-scrub refuses to mutate it for 15 seconds by default. Wait a moment, close/pause Claude Code, or explicitly override only if you know the session is not being written:
 
 ```bash
 ./ctx_scrub_claude.py redact --session-id <session-id> --query "text to remove" --apply --allow-recent
@@ -119,10 +127,11 @@ Use the generated continuation prompt when resuming Claude Code.
 
 Restore uses the latest backup for the session by default.
 
-## Rules For v0.1
+## Rules
 
 - Redaction first, not message deletion.
-- Use exact text only.
+- Use the transcript browser for visual review.
+- Use exact-text commands when you already know the exact string.
 - Do not mutate live sessions while Claude Code is actively writing.
 - Prefer `--session-id` over `--latest`.
 - Keep backups.

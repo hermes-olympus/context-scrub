@@ -16,9 +16,9 @@ cd context-scrub/claude
 ./ctx_scrub_claude.py doctor
 ```
 
-The first supported provider is Claude Code. v0.1 focuses on safe exact-text redaction in Claude Code JSONL session files.
+The first supported provider is Claude Code.
 
-## Claude Code v0.2
+## Claude Code v0.3
 
 ```bash
 ./ctxscrub
@@ -26,13 +26,19 @@ The first supported provider is Claude Code. v0.1 focuses on safe exact-text red
 
 Default interactive flow:
 
-- pick a Claude Code session
-- enter text to find
-- review all matching context fields
-- press `space` to mark/unmark matches
-- press `r` to redact selected matches
+- pick a Claude Code session by project/time/first-message label
+- browse the real session transcript: user messages, assistant replies, tool calls, and tool results
+- press `space` to mark/unmark whole transcript blocks
+- use `/` to find/filter inside the transcript when needed
+- press `r` to redact marked blocks
 - type `REDACT` to confirm
 - ctx-scrub creates a backup and verifies the JSONL
+
+Exact-text search still exists for command-line or pre-filtered workflows:
+
+```bash
+./ctxscrub --query "text to remove"
+```
 
 Scriptable flow:
 
@@ -62,7 +68,8 @@ Rollback:
 ## Safety Model
 
 - Redaction first, not message deletion.
-- Exact text only in v0.1.
+- Transcript browser redacts marked blocks without requiring a search term.
+- Exact-text redaction is still available for scriptable workflows.
 - Dry-run by default.
 - Timestamped backups before mutation.
 - Audit log for applied mutations.
@@ -76,4 +83,4 @@ Rollback:
 - Codex next
 - Cursor / VS Code extension storage later
 
-No embeddings or knowledge graph are included in v0.1.
+No embeddings or knowledge graph are included.
