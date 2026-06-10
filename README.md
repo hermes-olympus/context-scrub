@@ -2,6 +2,20 @@
 
 Local AI-client context scrubber.
 
+Public repo:
+
+```text
+https://github.com/hermes-olympus/context-scrub
+```
+
+Clone on another machine:
+
+```bash
+git clone https://github.com/hermes-olympus/context-scrub.git
+cd context-scrub/claude
+./ctx_scrub_claude.py doctor
+```
+
 The first supported provider is Claude Code. v0.1 focuses on safe exact-text redaction in Claude Code JSONL session files.
 
 ## Claude Code v0.1
