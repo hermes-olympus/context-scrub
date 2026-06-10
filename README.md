@@ -1,0 +1,56 @@
+# ctx-scrub
+
+Local AI-client context scrubber.
+
+The first supported provider is Claude Code. v0.1 focuses on safe exact-text redaction in Claude Code JSONL session files.
+
+## Claude Code v0.1
+
+```bash
+cd claude
+./ctx_scrub_claude.py doctor
+./ctx_scrub_claude.py workflow
+```
+
+Live-session flow:
+
+```bash
+./ctx_scrub_claude.py list --project-contains "your-project" --limit 10
+./ctx_scrub_claude.py inspect --session-id <session-id>
+./ctx_scrub_claude.py search --session-id <session-id> --query "text to remove"
+./ctx_scrub_claude.py review --session-id <session-id> --query "text to remove"
+./ctx_scrub_claude.py verify --session-id <session-id> --query "text to remove"
+```
+
+Direct dry-run and apply:
+
+```bash
+./ctx_scrub_claude.py redact --session-id <session-id> --query "text to remove"
+./ctx_scrub_claude.py redact --session-id <session-id> --query "text to remove" --apply
+```
+
+Rollback:
+
+```bash
+./ctx_scrub_claude.py backups --session-id <session-id>
+./ctx_scrub_claude.py restore --session-id <session-id>
+```
+
+## Safety Model
+
+- Redaction first, not message deletion.
+- Exact text only in v0.1.
+- Dry-run by default.
+- Timestamped backups before mutation.
+- Audit log for applied mutations.
+- Parent-link validation after writes.
+- Recent-file mutation guard for live sessions.
+- Subagent sessions excluded by default.
+
+## Provider Roadmap
+
+- `claude/` first
+- Codex next
+- Cursor / VS Code extension storage later
+
+No embeddings or knowledge graph are included in v0.1.

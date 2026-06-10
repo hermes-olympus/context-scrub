@@ -1,0 +1,603 @@
+#!/usr/bin/env python3
+"""Small Claude Code JSONL search/redaction prototype."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_BACKUP_DIR = SCRIPT_DIR / "backups"
+AUDIT_LOG = SCRIPT_DIR / "audit.jsonl"
+VERSION = "0.1.0"
+
+
+@dataclass
+class SessionFile:
+    path: Path
+    session_id: str
+    project: str
+    mtime: float
+    size: int
+    rows: int
+    is_subagent: bool
+
+
+def is_subagent_path(path: Path) -> bool:
+    return "subagents" in path.parts
+
+
+def project_label(path: Path) -> str:
+    try:
+        rel = path.relative_to(CLAUDE_PROJECTS)
+    except ValueError:
+        return path.parent.name
+    if len(rel.parts) < 2:
+        return path.parent.name
+    return rel.parts[0].replace("-", "/", 1).replace("-", "/")
+
+
+@dataclass
+class Match:
+    line_no: int
+    role: str
+    uuid: str
+    field_path: str
+    snippet: str
+
+
+def iter_jsonl_files() -> list[Path]:
+    if not CLAUDE_PROJECTS.exists():
+        return []
+    return sorted(CLAUDE_PROJECTS.glob("**/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def read_rows(path: Path) -> list[dict]:
+    rows: list[dict] = []
+    with path.open("r", encoding="utf-8") as fh:
+        for line_no, line in enumerate(fh, start=1):
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{path}:{line_no}: invalid JSONL: {exc}") from exc
+    return rows
+
+
+def json_dumps(row: dict) -> str:
+    return json.dumps(row, ensure_ascii=False, separators=(",", ":"))
+
+
+def session_info(path: Path) -> SessionFile:
+    rows = read_rows(path)
+    stat = path.stat()
+    return SessionFile(
+        path=path,
+        session_id=path.stem,
+        project=path.parent.name,
+        mtime=stat.st_mtime,
+        size=stat.st_size,
+        rows=len(rows),
+        is_subagent=is_subagent_path(path),
+    )
+
+
+def select_paths(args: argparse.Namespace) -> list[Path]:
+    files = iter_jsonl_files()
+    include_subagents = getattr(args, "include_subagents", False)
+    project_contains = getattr(args, "project_contains", None)
+    last_minutes = getattr(args, "last_minutes", None)
+    if not include_subagents:
+        files = [p for p in files if not is_subagent_path(p)]
+    if project_contains:
+        files = [p for p in files if project_contains.lower() in str(p).lower()]
+    if last_minutes:
+        cutoff = datetime.now(timezone.utc).timestamp() - (last_minutes * 60)
+        files = [p for p in files if p.stat().st_mtime >= cutoff]
+    if args.path:
+        return [Path(args.path).expanduser()]
+    if args.session_id:
+        matches = [p for p in files if p.stem == args.session_id]
+        if not matches:
+            raise SystemExit(f"No Claude JSONL found for session {args.session_id}")
+        return matches
+    if args.latest:
+        if not files:
+            raise SystemExit("No Claude JSONL files found")
+        return [files[0]]
+    return files
+
+
+def list_sessions(args: argparse.Namespace) -> None:
+    for info in [session_info(p) for p in select_paths(args)[: args.limit]]:
+        when = datetime.fromtimestamp(info.mtime, tz=timezone.utc).isoformat()
+        subagent = " subagent=true" if info.is_subagent else ""
+        label = project_label(info.path)
+        print(f"{when} rows={info.rows} size={info.size} session={info.session_id} project={label}{subagent}")
+        print(f"  {info.path}")
+
+
+def validate_parent_chain(rows: list[dict]) -> tuple[int, int]:
+    uuids = {row.get("uuid") for row in rows if row.get("uuid")}
+    refs = [row.get("parentUuid") for row in rows if row.get("parentUuid")]
+    missing = sum(1 for ref in refs if ref not in uuids)
+    return len(refs), missing
+
+
+def short_snippet(value: str, query: str, width: int = 90) -> str:
+    one_line = value.replace("\n", "\\n")
+    hit = one_line.find(query)
+    if hit == -1:
+        return one_line[: width * 2]
+    start = max(0, hit - width)
+    end = min(len(one_line), hit + len(query) + width)
+    return one_line[start:end]
+
+
+def iter_string_values(value: Any, prefix: str = "$"):
+    if isinstance(value, str):
+        yield prefix, value
+    elif isinstance(value, list):
+        for idx, item in enumerate(value):
+            yield from iter_string_values(item, f"{prefix}[{idx}]")
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield from iter_string_values(item, f"{prefix}.{key}")
+
+
+def replace_string_values(value: Any, query: str, replacement: str) -> tuple[Any, int]:
+    if isinstance(value, str):
+        count = value.count(query)
+        return value.replace(query, replacement), count
+    if isinstance(value, list):
+        new_items = []
+        total = 0
+        for item in value:
+            new_item, count = replace_string_values(item, query, replacement)
+            new_items.append(new_item)
+            total += count
+        return new_items, total
+    if isinstance(value, dict):
+        new_obj = {}
+        total = 0
+        for key, item in value.items():
+            new_item, count = replace_string_values(item, query, replacement)
+            new_obj[key] = new_item
+            total += count
+        return new_obj, total
+    return value, 0
+
+
+def row_role(row: dict) -> str:
+    message = row.get("message") if isinstance(row.get("message"), dict) else {}
+    return str(message.get("role") or row.get("type") or "")
+
+
+def search_text(path: Path, query: str) -> list[Match]:
+    matches: list[Match] = []
+    for idx, row in enumerate(read_rows(path), start=1):
+        if query not in json_dumps(row):
+            continue
+        role = row_role(row)
+        uuid = str(row.get("uuid") or "")
+        for field_path, value in iter_string_values(row):
+            if query not in value:
+                continue
+            snippet = short_snippet(value, query)
+            matches.append(Match(idx, role, uuid, field_path, snippet))
+    return matches
+
+
+def print_matches(path: Path, matches: list[Match], limit: int | None = None) -> None:
+    print(path)
+    shown = matches if limit is None else matches[:limit]
+    for match in shown:
+        uuid_text = f" uuid={match.uuid}" if match.uuid else ""
+        print(f"  line={match.line_no} role={match.role}{uuid_text}")
+        print(f"    field={match.field_path}")
+        print(f"    ...{match.snippet}...")
+    if limit is not None and len(matches) > limit:
+        print(f"  ...{len(matches) - limit} more matches hidden")
+
+
+def redact_rows(rows: list[dict], query: str, replacement: str) -> tuple[list[dict], int]:
+    redacted_rows: list[dict] = []
+    total = 0
+    for row in rows:
+        new_row, count = replace_string_values(row, query, replacement)
+        redacted_rows.append(new_row)
+        total += count
+    return redacted_rows, total
+
+
+def write_rows(path: Path, rows: list[dict]) -> None:
+    path.write_text("".join(json_dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+
+def backup_file(path: Path, backup_dir_arg: str | None) -> Path:
+    backup_dir = Path(backup_dir_arg).expanduser() if backup_dir_arg else DEFAULT_BACKUP_DIR
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup = backup_dir / f"{path.name}.ctxscrub-{stamp}.bak"
+    shutil.copy2(path, backup)
+    return backup
+
+
+def assert_not_recently_modified(path: Path, threshold_seconds: int, allow_recent: bool) -> None:
+    if allow_recent or threshold_seconds <= 0:
+        return
+    age = datetime.now(timezone.utc).timestamp() - path.stat().st_mtime
+    if age < threshold_seconds:
+        raise SystemExit(
+            f"Refusing to modify recently changed file ({age:.1f}s old): {path}\n"
+            f"Close/pause Claude Code or wait, then retry. Override with --allow-recent."
+        )
+
+
+def audit(action: str, **fields: Any) -> None:
+    AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "action": action,
+        **fields,
+    }
+    with AUDIT_LOG.open("a", encoding="utf-8") as fh:
+        fh.write(json_dumps(record) + "\n")
+
+
+def iter_backups(backup_dir_arg: str | None = None, session_id: str | None = None) -> list[Path]:
+    backup_dir = Path(backup_dir_arg).expanduser() if backup_dir_arg else DEFAULT_BACKUP_DIR
+    if not backup_dir.exists():
+        return []
+    backups = sorted(backup_dir.glob("*.jsonl.ctxscrub-*.bak"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if session_id:
+        backups = [p for p in backups if p.name.startswith(f"{session_id}.jsonl.")]
+    return backups
+
+
+def cmd_inspect(args: argparse.Namespace) -> None:
+    from collections import Counter
+
+    for path in select_paths(args):
+        rows = read_rows(path)
+        refs, missing = validate_parent_chain(rows)
+        types = Counter(row.get("type", "<none>") for row in rows)
+        roles = Counter(row_role(row) for row in rows)
+        print(path)
+        print(f"  rows={len(rows)} size={path.stat().st_size}")
+        print(f"  parent_refs={refs} missing_parent_refs={missing}")
+        print(f"  event_types={dict(types.most_common())}")
+        print(f"  roles={dict(roles.most_common())}")
+
+
+def cmd_search(args: argparse.Namespace) -> None:
+    total = 0
+    for path in select_paths(args):
+        matches = search_text(path, args.query)
+        if not matches:
+            continue
+        total += len(matches)
+        print_matches(path, matches, args.limit)
+    print(f"matches={total}")
+
+
+def cmd_verify(args: argparse.Namespace) -> None:
+    failed = False
+    for path in select_paths(args):
+        rows = read_rows(path)
+        refs, missing = validate_parent_chain(rows)
+        contains = args.query in path.read_text(encoding="utf-8") if args.query else False
+        status = "ok" if missing == 0 and not contains else "attention"
+        print(f"{status}: {path}")
+        print(f"  rows={len(rows)} parent_refs={refs} missing_parent_refs={missing}")
+        if args.query:
+            print(f"  contains_query={contains}")
+        failed = failed or missing != 0 or contains
+    if failed:
+        raise SystemExit(1)
+
+
+def apply_redaction(
+    path: Path,
+    query: str,
+    replacement: str,
+    backup_dir: str | None,
+    recent_threshold_seconds: int,
+    allow_recent: bool,
+) -> tuple[int, Path]:
+    assert_not_recently_modified(path, recent_threshold_seconds, allow_recent)
+    rows = read_rows(path)
+    new_rows, count = redact_rows(rows, query, replacement)
+    if count == 0:
+        return 0, Path("")
+
+    backup = backup_file(path, backup_dir)
+    write_rows(path, new_rows)
+    verified_rows = read_rows(path)
+    _, missing = validate_parent_chain(verified_rows)
+    still_contains = query in path.read_text(encoding="utf-8")
+    if missing or still_contains:
+        shutil.copy2(backup, path)
+        audit(
+            "redact_failed_restored",
+            path=str(path),
+            backup=str(backup),
+            replacement=replacement,
+            missing_parent_refs=missing,
+            contains_query=still_contains,
+        )
+        raise SystemExit(
+            f"Redaction verification failed; restored backup. missing_parent_refs={missing} contains_query={still_contains}"
+        )
+    audit(
+        "redact",
+        path=str(path),
+        backup=str(backup),
+        occurrences=count,
+        replacement=replacement,
+        session_id=path.stem,
+    )
+    return count, backup
+
+
+def cmd_redact(args: argparse.Namespace) -> None:
+    replacement = args.replacement or "[CTX_SCRUB_REDACTED]"
+    for path in select_paths(args):
+        rows = read_rows(path)
+        _, count = redact_rows(rows, args.query, replacement)
+        print(f"{path}")
+        print(f"  occurrences={count}")
+        if count == 0:
+            continue
+        if not args.apply:
+            print("  dry_run=true")
+            continue
+
+        applied, backup = apply_redaction(
+            path,
+            args.query,
+            replacement,
+            args.backup_dir,
+            args.recent_threshold_seconds,
+            args.allow_recent,
+        )
+        refs, missing = validate_parent_chain(read_rows(path))
+        print(f"  backup={backup}")
+        print(f"  applied=true replaced={applied} parent_refs={refs} missing_parent_refs={missing} contains_query=False")
+
+
+def cmd_review(args: argparse.Namespace) -> None:
+    replacement = args.replacement or "[CTX_SCRUB_REDACTED]"
+    targets = []
+    for path in select_paths(args):
+        matches = search_text(path, args.query)
+        if not matches:
+            continue
+        print_matches(path, matches, args.limit)
+        targets.append((path, len(matches)))
+
+    if not targets:
+        print("matches=0")
+        return
+
+    print(f"matched_files={len(targets)} replacement={replacement}")
+    print("Type REDACT to apply redaction to all matched selected files, anything else to cancel.")
+    answer = input("> ").strip()
+    if answer != "REDACT":
+        print("cancelled=true")
+        return
+
+    for path, _ in targets:
+        applied, backup = apply_redaction(
+            path,
+            args.query,
+            replacement,
+            args.backup_dir,
+            args.recent_threshold_seconds,
+            args.allow_recent,
+        )
+        print(f"applied {applied} replacements in {path}")
+        print(f"  backup={backup}")
+
+
+def cmd_clean_prompt(args: argparse.Namespace) -> None:
+    for path in select_paths(args):
+        matches = search_text(path, args.query)
+        print(f"# Clean Continuation Prompt For Claude Code")
+        print()
+        print(f"Session: `{path.stem}`")
+        print(f"Source: `{path}`")
+        print()
+        print("## Context Cleanup")
+        print()
+        print(f"Redact this exact phrase before continuing: `{args.query}`")
+        print(f"Matching fields found: {len(matches)}")
+        print()
+        print("## Suggested Next Prompt")
+        print()
+        print("Continue from this session, but ignore any previous details that were replaced with `[CTX_SCRUB_REDACTED]`.")
+        print("Use only the remaining current task, decisions, files, and verified results.")
+
+
+def cmd_backups(args: argparse.Namespace) -> None:
+    backups = iter_backups(args.backup_dir, args.session_id)
+    if not backups:
+        print("backups=0")
+        return
+    for backup in backups[: args.limit]:
+        when = datetime.fromtimestamp(backup.stat().st_mtime, tz=timezone.utc).isoformat()
+        print(f"{when} size={backup.stat().st_size} backup={backup}")
+
+
+def cmd_restore(args: argparse.Namespace) -> None:
+    targets = select_paths(args)
+    if len(targets) != 1:
+        raise SystemExit("Restore needs exactly one target selected by --session-id or --path")
+    target = targets[0]
+    backup = Path(args.backup).expanduser() if args.backup else None
+    if backup is None:
+        backups = iter_backups(args.backup_dir, target.stem)
+        if not backups:
+            raise SystemExit(f"No backups found for session {target.stem}")
+        backup = backups[0]
+    if not backup.exists():
+        raise SystemExit(f"Backup not found: {backup}")
+
+    assert_not_recently_modified(target, args.recent_threshold_seconds, args.allow_recent)
+    pre_restore = backup_file(target, args.backup_dir)
+    shutil.copy2(backup, target)
+    rows = read_rows(target)
+    refs, missing = validate_parent_chain(rows)
+    audit(
+        "restore",
+        path=str(target),
+        restored_from=str(backup),
+        pre_restore_backup=str(pre_restore),
+        session_id=target.stem,
+        missing_parent_refs=missing,
+    )
+    print(f"restored={target}")
+    print(f"from_backup={backup}")
+    print(f"pre_restore_backup={pre_restore}")
+    print(f"rows={len(rows)} parent_refs={refs} missing_parent_refs={missing}")
+    if missing:
+        raise SystemExit(1)
+
+
+def cmd_doctor(args: argparse.Namespace) -> None:
+    files = iter_jsonl_files()
+    top_level = [p for p in files if not is_subagent_path(p)]
+    backups = iter_backups(None, None)
+    print(f"ctx-scrub-claude version={VERSION}")
+    print(f"claude_projects={CLAUDE_PROJECTS} exists={CLAUDE_PROJECTS.exists()}")
+    print(f"jsonl_sessions={len(files)} top_level_sessions={len(top_level)}")
+    print(f"default_backup_dir={DEFAULT_BACKUP_DIR} exists={DEFAULT_BACKUP_DIR.exists()} backups={len(backups)}")
+    print(f"audit_log={AUDIT_LOG} exists={AUDIT_LOG.exists()}")
+    if top_level:
+        info = session_info(top_level[0])
+        when = datetime.fromtimestamp(info.mtime, tz=timezone.utc).isoformat()
+        print(f"latest_top_level={info.session_id} updated={when} project={project_label(info.path)}")
+    print("status=ok")
+
+
+def cmd_workflow(args: argparse.Namespace) -> None:
+    print("v0.1 live Claude Code redaction workflow")
+    print()
+    print("1. Find the right session:")
+    print("   ./ctx_scrub_claude.py list --project-contains '<project-name>' --limit 10")
+    print()
+    print("2. Inspect it:")
+    print("   ./ctx_scrub_claude.py inspect --session-id <session-id>")
+    print()
+    print("3. Search exact text:")
+    print("   ./ctx_scrub_claude.py search --session-id <session-id> --query '<text>'")
+    print()
+    print("4. Review interactively:")
+    print("   ./ctx_scrub_claude.py review --session-id <session-id> --query '<text>'")
+    print()
+    print("5. Or dry-run then apply:")
+    print("   ./ctx_scrub_claude.py redact --session-id <session-id> --query '<text>'")
+    print("   ./ctx_scrub_claude.py redact --session-id <session-id> --query '<text>' --apply")
+    print()
+    print("6. Verify:")
+    print("   ./ctx_scrub_claude.py verify --session-id <session-id> --query '<text>'")
+    print()
+    print("7. Roll back if needed:")
+    print("   ./ctx_scrub_claude.py backups --session-id <session-id>")
+    print("   ./ctx_scrub_claude.py restore --session-id <session-id>")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Claude Code JSONL context scrubber prototype")
+    parser.add_argument("--version", action="version", version=f"ctx-scrub-claude {VERSION}")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    def add_selectors(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--latest", action="store_true", help="Use the newest Claude JSONL session")
+        p.add_argument("--session-id", help="Use a specific Claude session UUID")
+        p.add_argument("--path", help="Use a specific JSONL path")
+        p.add_argument("--project-contains", help="Only consider sessions whose path contains this text")
+        p.add_argument("--last-minutes", type=int, help="Only consider sessions modified within this many minutes")
+        p.add_argument("--include-subagents", action="store_true", help="Include subagent JSONL files")
+
+    p_list = sub.add_parser("list", help="List Claude JSONL sessions")
+    add_selectors(p_list)
+    p_list.add_argument("--limit", type=int, default=20)
+    p_list.set_defaults(func=list_sessions)
+
+    p_inspect = sub.add_parser("inspect", help="Inspect selected Claude JSONL sessions")
+    add_selectors(p_inspect)
+    p_inspect.set_defaults(func=cmd_inspect)
+
+    p_search = sub.add_parser("search", help="Search for exact text")
+    add_selectors(p_search)
+    p_search.add_argument("--query", required=True)
+    p_search.add_argument("--limit", type=int, default=None, help="Maximum matches to show per file")
+    p_search.set_defaults(func=cmd_search)
+
+    p_review = sub.add_parser("review", help="Interactively review and redact exact text")
+    add_selectors(p_review)
+    p_review.add_argument("--query", required=True)
+    p_review.add_argument("--replacement")
+    p_review.add_argument("--backup-dir")
+    p_review.add_argument("--limit", type=int, default=30, help="Maximum matches to show per file")
+    p_review.add_argument("--recent-threshold-seconds", type=int, default=15)
+    p_review.add_argument("--allow-recent", action="store_true", help="Allow mutation of a recently modified JSONL")
+    p_review.set_defaults(func=cmd_review)
+
+    p_verify = sub.add_parser("verify", help="Verify JSONL parse, parent links, and optional query absence")
+    add_selectors(p_verify)
+    p_verify.add_argument("--query")
+    p_verify.set_defaults(func=cmd_verify)
+
+    p_redact = sub.add_parser("redact", help="Replace exact text in selected JSONL files")
+    add_selectors(p_redact)
+    p_redact.add_argument("--query", required=True)
+    p_redact.add_argument("--replacement")
+    p_redact.add_argument("--backup-dir")
+    p_redact.add_argument("--apply", action="store_true", help="Actually write changes; default is dry-run")
+    p_redact.add_argument("--recent-threshold-seconds", type=int, default=15)
+    p_redact.add_argument("--allow-recent", action="store_true", help="Allow mutation of a recently modified JSONL")
+    p_redact.set_defaults(func=cmd_redact)
+
+    p_clean = sub.add_parser("clean-prompt", help="Generate a clean continuation prompt after redaction")
+    add_selectors(p_clean)
+    p_clean.add_argument("--query", required=True)
+    p_clean.set_defaults(func=cmd_clean_prompt)
+
+    p_backups = sub.add_parser("backups", help="List ctx-scrub backups")
+    p_backups.add_argument("--session-id", help="Filter backups by session UUID")
+    p_backups.add_argument("--backup-dir")
+    p_backups.add_argument("--limit", type=int, default=20)
+    p_backups.set_defaults(func=cmd_backups)
+
+    p_restore = sub.add_parser("restore", help="Restore a selected Claude JSONL session from backup")
+    add_selectors(p_restore)
+    p_restore.add_argument("--backup", help="Backup file to restore from; defaults to latest backup for session")
+    p_restore.add_argument("--backup-dir")
+    p_restore.add_argument("--recent-threshold-seconds", type=int, default=15)
+    p_restore.add_argument("--allow-recent", action="store_true", help="Allow restore over a recently modified JSONL")
+    p_restore.set_defaults(func=cmd_restore)
+
+    p_doctor = sub.add_parser("doctor", help="Check local Claude/ctx-scrub readiness")
+    p_doctor.set_defaults(func=cmd_doctor)
+
+    p_workflow = sub.add_parser("workflow", help="Print the recommended v0.1 live-session workflow")
+    p_workflow.set_defaults(func=cmd_workflow)
+
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
